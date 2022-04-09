@@ -93,25 +93,7 @@ func NewLimiter(r Limit, b int) *Limiter {
 
 // Allow is shorthand for AllowN(time.Now(), 1).
 func (lim *Limiter) Allow() bool {
-	return lim.reserve(time.Now()).ok
-}
-
-// A Reservation holds information about events that are permitted by a Limiter to happen after a delay.
-// A Reservation may be canceled, which may enable the Limiter to permit additional events.
-type Reservation struct {
-	ok        bool
-	lim       *Limiter
-	tokens    int
-	timeToAct time.Time
-	// This is the Limit at reservation time, it can change later.
-	limit Limit
-}
-
-// OK returns whether the limiter can provide the requested number of tokens
-// within the maximum wait time.  If OK is false, Delay returns InfDuration, and
-// Cancel does nothing.
-func (r *Reservation) OK() bool {
-	return r.ok
+	return lim.reserve(time.Now())
 }
 
 // InfDuration is the duration returned by Delay when a Reservation is not OK.
@@ -120,29 +102,19 @@ const InfDuration = time.Duration(1<<63 - 1)
 // reserve is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 // reserve returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
-func (lim *Limiter) reserve(now time.Time) Reservation {
+func (lim *Limiter) reserve(now time.Time) bool {
 	lim.mu.Lock()
 	defer lim.mu.Unlock()
 
 	if lim.limit == Inf {
-		return Reservation{
-			ok:        true,
-			lim:       lim,
-			tokens:    1,
-			timeToAct: now,
-		}
+		return true
 	} else if lim.limit == 0 {
 		var ok bool
 		if lim.burst >= 1 {
 			ok = true
 			lim.burst--
 		}
-		return Reservation{
-			ok:        ok,
-			lim:       lim,
-			tokens:    lim.burst,
-			timeToAct: now,
-		}
+		return ok
 	}
 
 	now, last, tokens := lim.advance(now)
@@ -159,27 +131,16 @@ func (lim *Limiter) reserve(now time.Time) Reservation {
 	// Decide result
 	ok := 1 <= lim.burst && waitDuration == 0
 
-	// Prepare reservation
-	r := Reservation{
-		ok:    ok,
-		lim:   lim,
-		limit: lim.limit,
-	}
-	if ok {
-		r.tokens = 1
-		r.timeToAct = now.Add(waitDuration)
-	}
-
 	// Update state
 	if ok {
 		lim.last = now
 		lim.tokens = tokens
-		lim.lastEvent = r.timeToAct
+		lim.lastEvent = now.Add(waitDuration)
 	} else {
 		lim.last = last
 	}
 
-	return r
+	return ok
 }
 
 // advance calculates and returns an updated state for lim resulting from the passage of time.
