@@ -6,8 +6,6 @@
 package rate
 
 import (
-	"context"
-	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -119,28 +117,8 @@ func (r *Reservation) OK() bool {
 	return r.ok
 }
 
-// Delay is shorthand for DelayFrom(time.Now()).
-func (r *Reservation) Delay() time.Duration {
-	return r.DelayFrom(time.Now())
-}
-
 // InfDuration is the duration returned by Delay when a Reservation is not OK.
 const InfDuration = time.Duration(1<<63 - 1)
-
-// DelayFrom returns the duration for which the reservation holder must wait
-// before taking the reserved action.  Zero duration means act immediately.
-// InfDuration means the limiter cannot grant the tokens requested in this
-// Reservation within the maximum wait time.
-func (r *Reservation) DelayFrom(now time.Time) time.Duration {
-	if !r.ok {
-		return InfDuration
-	}
-	delay := r.timeToAct.Sub(now)
-	if delay < 0 {
-		return 0
-	}
-	return delay
-}
 
 // Cancel is shorthand for CancelAt(time.Now()).
 func (r *Reservation) Cancel() {
@@ -209,60 +187,6 @@ func (lim *Limiter) Reserve() *Reservation {
 func (lim *Limiter) ReserveN(now time.Time, n int) *Reservation {
 	r := lim.reserveN(now, n, InfDuration)
 	return &r
-}
-
-// Wait is shorthand for WaitN(ctx, 1).
-func (lim *Limiter) Wait(ctx context.Context) (err error) {
-	return lim.WaitN(ctx, 1)
-}
-
-// WaitN blocks until lim permits n events to happen.
-// It returns an error if n exceeds the Limiter's burst size, the Context is
-// canceled, or the expected wait time exceeds the Context's Deadline.
-// The burst limit is ignored if the rate limit is Inf.
-func (lim *Limiter) WaitN(ctx context.Context, n int) (err error) {
-	lim.mu.Lock()
-	burst := lim.burst
-	limit := lim.limit
-	lim.mu.Unlock()
-
-	if n > burst && limit != Inf {
-		return fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", n, burst)
-	}
-	// Check if ctx is already cancelled
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	// Determine wait limit
-	now := time.Now()
-	waitLimit := InfDuration
-	if deadline, ok := ctx.Deadline(); ok {
-		waitLimit = deadline.Sub(now)
-	}
-	// Reserve
-	r := lim.reserveN(now, n, waitLimit)
-	if !r.ok {
-		return fmt.Errorf("rate: Wait(n=%d) would exceed context deadline", n)
-	}
-	// Wait if necessary
-	delay := r.DelayFrom(now)
-	if delay == 0 {
-		return nil
-	}
-	t := time.NewTimer(delay)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		// We can proceed.
-		return nil
-	case <-ctx.Done():
-		// Context was canceled before we could proceed.  Cancel the
-		// reservation, which may permit other events to proceed sooner.
-		r.Cancel()
-		return ctx.Err()
-	}
 }
 
 // SetLimit is shorthand for SetLimitAt(time.Now(), newLimit).

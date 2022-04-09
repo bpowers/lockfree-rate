@@ -8,7 +8,6 @@
 package rate
 
 import (
-	"context"
 	"math"
 	"runtime"
 	"sync"
@@ -394,105 +393,6 @@ func TestReserveMax(t *testing.T) {
 	runReserveMax(t, lim, request{t0, 1, t2, false}, maxT) // time to act too far in the future
 }
 
-type wait struct {
-	name   string
-	ctx    context.Context
-	n      int
-	delay  int // in multiples of d
-	nilErr bool
-}
-
-func runWait(t *testing.T, lim *Limiter, w wait) {
-	t.Helper()
-	start := time.Now()
-	err := lim.WaitN(w.ctx, w.n)
-	delay := time.Since(start)
-
-	if (w.nilErr && err != nil) || (!w.nilErr && err == nil) || !waitDelayOk(w.delay, delay) {
-		errString := "<nil>"
-		if !w.nilErr {
-			errString = "<non-nil error>"
-		}
-		t.Errorf("lim.WaitN(%v, lim, %v) = %v with delay %v; want %v with delay %v (±%v)",
-			w.name, w.n, err, delay, errString, d*time.Duration(w.delay), d/2)
-	}
-}
-
-// waitDelayOk reports whether a duration spent in WaitN is “close enough” to
-// wantD multiples of d, given scheduling slop.
-func waitDelayOk(wantD int, got time.Duration) bool {
-	gotD := dFromDuration(got)
-
-	// The actual time spent waiting will be REDUCED by the amount of time spent
-	// since the last call to the limiter. We expect the time in between calls to
-	// be executing simple, straight-line, non-blocking code, so it should reduce
-	// the wait time by no more than half a d, which would round to exactly wantD.
-	if gotD < wantD {
-		return false
-	}
-
-	// The actual time spend waiting will be INCREASED by the amount of scheduling
-	// slop in the platform's sleep syscall, plus the amount of time spent executing
-	// straight-line code before measuring the elapsed duration.
-	// (The latter is surely less than half a d.)
-	maxD := wantD
-	switch runtime.GOOS {
-	case "netbsd", "openbsd", "android", "plan9":
-		// NetBSD and OpenBSD tend to overshoot sleeps by a wide margin due to a
-		// suspected platform bug; see https://go.dev/issue/44067 and
-		// https://go.dev/issue/50189.
-		//
-		// Android and plan9 were empirically observed to overshoot too.
-		// Android might be trying to conserve power.
-		// For plan9, I (bcmills) am not sure what the problem would be.
-		maxD = (wantD*3 + 1) / 2 // 150% of wantD, rounded up.
-	}
-	return gotD <= maxD
-}
-
-func TestWaitSimple(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	runWait(t, lim, wait{"already-cancelled", ctx, 1, 0, false})
-
-	runWait(t, lim, wait{"exceed-burst-error", context.Background(), 4, 0, false})
-
-	runWait(t, lim, wait{"act-now", context.Background(), 2, 0, true})
-	runWait(t, lim, wait{"act-later", context.Background(), 3, 2, true})
-}
-
-func TestWaitCancel(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	runWait(t, lim, wait{"act-now", ctx, 2, 0, true}) // after this lim.tokens = 1
-	go func() {
-		time.Sleep(d)
-		cancel()
-	}()
-	runWait(t, lim, wait{"will-cancel", ctx, 3, 1, false})
-	// should get 3 tokens back, and have lim.tokens = 2
-	t.Logf("tokens:%v last:%v lastEvent:%v", lim.tokens, lim.last, lim.lastEvent)
-	runWait(t, lim, wait{"act-now-after-cancel", context.Background(), 2, 0, true})
-}
-
-func TestWaitTimeout(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithTimeout(context.Background(), d)
-	defer cancel()
-	runWait(t, lim, wait{"act-now", ctx, 2, 0, true})
-	runWait(t, lim, wait{"w-timeout-err", ctx, 3, 0, false})
-}
-
-func TestWaitInf(t *testing.T) {
-	lim := NewLimiter(Inf, 0)
-
-	runWait(t, lim, wait{"exceed-burst-no-error", context.Background(), 3, 0, true})
-}
-
 func BenchmarkAllowN(b *testing.B) {
 	lim := NewLimiter(Every(1*time.Second), 1)
 	now := time.Now()
@@ -503,16 +403,6 @@ func BenchmarkAllowN(b *testing.B) {
 			lim.AllowN(now, 1)
 		}
 	})
-}
-
-func BenchmarkWaitNNoDelay(b *testing.B) {
-	lim := NewLimiter(Limit(b.N), b.N)
-	ctx := context.Background()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		lim.WaitN(ctx, 1)
-	}
 }
 
 func TestZeroLimit(t *testing.T) {
