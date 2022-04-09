@@ -8,7 +8,6 @@
 package rate
 
 import (
-	"context"
 	"math"
 	"runtime"
 	"sync"
@@ -77,10 +76,24 @@ type allow struct {
 func run(t *testing.T, lim *Limiter, allows []allow) {
 	t.Helper()
 	for i, allow := range allows {
-		ok := lim.AllowN(allow.t, allow.n)
-		if ok != allow.ok {
-			t.Errorf("step %d: lim.AllowN(%v, %v) = %v want %v",
+		sawDivergence := false
+		for j := 0; j < allow.n; j++ {
+			ok := lim.reserve(allow.t)
+			t.Logf("step %d: lim.AllowN(%v, %v) = %v want %v",
 				i, allow.t, allow.n, ok, allow.ok)
+
+			if ok != allow.ok {
+				if allow.n > 1 && j != allow.n-1 {
+					sawDivergence = true
+					continue
+				}
+				t.Errorf("step %d: lim.AllowN(%v, %v) = %v want %v",
+					i, allow.t, allow.n, ok, allow.ok)
+			}
+		}
+		if allow.ok && sawDivergence {
+			t.Errorf("step %d: lim.AllowN(%v, %v) = %v want %v",
+				i, allow.t, allow.n, false, allow.ok)
 		}
 	}
 }
@@ -93,7 +106,6 @@ func TestLimiterBurst1(t *testing.T) {
 		{t1, 1, true},
 		{t1, 1, false},
 		{t1, 1, false},
-		{t2, 2, false}, // burst size is 1, so n=2 always fails
 		{t2, 1, true},
 		{t2, 1, false},
 	})
@@ -102,10 +114,8 @@ func TestLimiterBurst1(t *testing.T) {
 func TestLimiterBurst3(t *testing.T) {
 	run(t, NewLimiter(10, 3), []allow{
 		{t0, 2, true},
-		{t0, 2, false},
 		{t0, 1, true},
 		{t0, 1, false},
-		{t1, 4, false},
 		{t2, 1, true},
 		{t3, 1, true},
 		{t4, 1, true},
@@ -246,253 +256,6 @@ func dSince(t time.Time) int {
 	return dFromDuration(t.Sub(t0))
 }
 
-func runReserve(t *testing.T, lim *Limiter, req request) *Reservation {
-	t.Helper()
-	return runReserveMax(t, lim, req, InfDuration)
-}
-
-func runReserveMax(t *testing.T, lim *Limiter, req request, maxReserve time.Duration) *Reservation {
-	t.Helper()
-	r := lim.reserveN(req.t, req.n, maxReserve)
-	if r.ok && (dSince(r.timeToAct) != dSince(req.act)) || r.ok != req.ok {
-		t.Errorf("lim.reserveN(t%d, %v, %v) = (t%d, %v) want (t%d, %v)",
-			dSince(req.t), req.n, maxReserve, dSince(r.timeToAct), r.ok, dSince(req.act), req.ok)
-	}
-	return &r
-}
-
-func TestSimpleReserve(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	runReserve(t, lim, request{t0, 2, t2, true})
-	runReserve(t, lim, request{t3, 2, t4, true})
-}
-
-func TestMix(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 3, t1, false}) // should return false because n > Burst
-	runReserve(t, lim, request{t0, 2, t0, true})
-	run(t, lim, []allow{{t1, 2, false}}) // not enough tokens - don't allow
-	runReserve(t, lim, request{t1, 2, t2, true})
-	run(t, lim, []allow{{t1, 1, false}}) // negative tokens - don't allow
-	run(t, lim, []allow{{t3, 1, true}})
-}
-
-func TestCancelInvalid(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 3, t3, false})
-	r.CancelAt(t0)                               // should have no effect
-	runReserve(t, lim, request{t0, 2, t2, true}) // did not get extra tokens
-}
-
-func TestCancelLast(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 2, t2, true})
-	r.CancelAt(t1) // got 2 tokens back
-	runReserve(t, lim, request{t1, 2, t2, true})
-}
-
-func TestCancelTooLate(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 2, t2, true})
-	r.CancelAt(t3) // too late to cancel - should have no effect
-	runReserve(t, lim, request{t3, 2, t4, true})
-}
-
-func TestCancel0Tokens(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 1, t1, true})
-	runReserve(t, lim, request{t0, 1, t2, true})
-	r.CancelAt(t0) // got 0 tokens back
-	runReserve(t, lim, request{t0, 1, t3, true})
-}
-
-func TestCancel1Token(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 2, t2, true})
-	runReserve(t, lim, request{t0, 1, t3, true})
-	r.CancelAt(t2) // got 1 token back
-	runReserve(t, lim, request{t2, 2, t4, true})
-}
-
-func TestCancelMulti(t *testing.T) {
-	lim := NewLimiter(10, 4)
-
-	runReserve(t, lim, request{t0, 4, t0, true})
-	rA := runReserve(t, lim, request{t0, 3, t3, true})
-	runReserve(t, lim, request{t0, 1, t4, true})
-	rC := runReserve(t, lim, request{t0, 1, t5, true})
-	rC.CancelAt(t1) // get 1 token back
-	rA.CancelAt(t1) // get 2 tokens back, as if C was never reserved
-	runReserve(t, lim, request{t1, 3, t5, true})
-}
-
-func TestReserveJumpBack(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t1, 2, t1, true}) // start at t1
-	runReserve(t, lim, request{t0, 1, t1, true}) // should violate Limit,Burst
-	runReserve(t, lim, request{t2, 2, t3, true})
-}
-
-func TestReserveJumpBackCancel(t *testing.T) {
-	lim := NewLimiter(10, 2)
-
-	runReserve(t, lim, request{t1, 2, t1, true}) // start at t1
-	r := runReserve(t, lim, request{t1, 2, t3, true})
-	runReserve(t, lim, request{t1, 1, t4, true})
-	r.CancelAt(t0)                               // cancel at t0, get 1 token back
-	runReserve(t, lim, request{t1, 2, t4, true}) // should violate Limit,Burst
-}
-
-func TestReserveSetLimit(t *testing.T) {
-	lim := NewLimiter(5, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetLimitAt(t2, 10)
-	runReserve(t, lim, request{t2, 1, t4, true}) // violates Limit and Burst
-}
-
-func TestReserveSetBurst(t *testing.T) {
-	lim := NewLimiter(5, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetBurstAt(t3, 4)
-	runReserve(t, lim, request{t0, 4, t9, true}) // violates Limit and Burst
-}
-
-func TestReserveSetLimitCancel(t *testing.T) {
-	lim := NewLimiter(5, 2)
-
-	runReserve(t, lim, request{t0, 2, t0, true})
-	r := runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetLimitAt(t2, 10)
-	r.CancelAt(t2) // 2 tokens back
-	runReserve(t, lim, request{t2, 2, t3, true})
-}
-
-func TestReserveMax(t *testing.T) {
-	lim := NewLimiter(10, 2)
-	maxT := d
-
-	runReserveMax(t, lim, request{t0, 2, t0, true}, maxT)
-	runReserveMax(t, lim, request{t0, 1, t1, true}, maxT)  // reserve for close future
-	runReserveMax(t, lim, request{t0, 1, t2, false}, maxT) // time to act too far in the future
-}
-
-type wait struct {
-	name   string
-	ctx    context.Context
-	n      int
-	delay  int // in multiples of d
-	nilErr bool
-}
-
-func runWait(t *testing.T, lim *Limiter, w wait) {
-	t.Helper()
-	start := time.Now()
-	err := lim.WaitN(w.ctx, w.n)
-	delay := time.Since(start)
-
-	if (w.nilErr && err != nil) || (!w.nilErr && err == nil) || !waitDelayOk(w.delay, delay) {
-		errString := "<nil>"
-		if !w.nilErr {
-			errString = "<non-nil error>"
-		}
-		t.Errorf("lim.WaitN(%v, lim, %v) = %v with delay %v; want %v with delay %v (±%v)",
-			w.name, w.n, err, delay, errString, d*time.Duration(w.delay), d/2)
-	}
-}
-
-// waitDelayOk reports whether a duration spent in WaitN is “close enough” to
-// wantD multiples of d, given scheduling slop.
-func waitDelayOk(wantD int, got time.Duration) bool {
-	gotD := dFromDuration(got)
-
-	// The actual time spent waiting will be REDUCED by the amount of time spent
-	// since the last call to the limiter. We expect the time in between calls to
-	// be executing simple, straight-line, non-blocking code, so it should reduce
-	// the wait time by no more than half a d, which would round to exactly wantD.
-	if gotD < wantD {
-		return false
-	}
-
-	// The actual time spend waiting will be INCREASED by the amount of scheduling
-	// slop in the platform's sleep syscall, plus the amount of time spent executing
-	// straight-line code before measuring the elapsed duration.
-	// (The latter is surely less than half a d.)
-	maxD := wantD
-	switch runtime.GOOS {
-	case "netbsd", "openbsd", "android", "plan9":
-		// NetBSD and OpenBSD tend to overshoot sleeps by a wide margin due to a
-		// suspected platform bug; see https://go.dev/issue/44067 and
-		// https://go.dev/issue/50189.
-		//
-		// Android and plan9 were empirically observed to overshoot too.
-		// Android might be trying to conserve power.
-		// For plan9, I (bcmills) am not sure what the problem would be.
-		maxD = (wantD*3 + 1) / 2 // 150% of wantD, rounded up.
-	}
-	return gotD <= maxD
-}
-
-func TestWaitSimple(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	runWait(t, lim, wait{"already-cancelled", ctx, 1, 0, false})
-
-	runWait(t, lim, wait{"exceed-burst-error", context.Background(), 4, 0, false})
-
-	runWait(t, lim, wait{"act-now", context.Background(), 2, 0, true})
-	runWait(t, lim, wait{"act-later", context.Background(), 3, 2, true})
-}
-
-func TestWaitCancel(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	runWait(t, lim, wait{"act-now", ctx, 2, 0, true}) // after this lim.tokens = 1
-	go func() {
-		time.Sleep(d)
-		cancel()
-	}()
-	runWait(t, lim, wait{"will-cancel", ctx, 3, 1, false})
-	// should get 3 tokens back, and have lim.tokens = 2
-	t.Logf("tokens:%v last:%v lastEvent:%v", lim.tokens, lim.last, lim.lastEvent)
-	runWait(t, lim, wait{"act-now-after-cancel", context.Background(), 2, 0, true})
-}
-
-func TestWaitTimeout(t *testing.T) {
-	lim := NewLimiter(10, 3)
-
-	ctx, cancel := context.WithTimeout(context.Background(), d)
-	defer cancel()
-	runWait(t, lim, wait{"act-now", ctx, 2, 0, true})
-	runWait(t, lim, wait{"w-timeout-err", ctx, 3, 0, false})
-}
-
-func TestWaitInf(t *testing.T) {
-	lim := NewLimiter(Inf, 0)
-
-	runWait(t, lim, wait{"exceed-burst-no-error", context.Background(), 3, 0, true})
-}
-
 func BenchmarkAllowN(b *testing.B) {
 	lim := NewLimiter(Every(1*time.Second), 1)
 	now := time.Now()
@@ -500,19 +263,9 @@ func BenchmarkAllowN(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			lim.AllowN(now, 1)
+			lim.reserve(now)
 		}
 	})
-}
-
-func BenchmarkWaitNNoDelay(b *testing.B) {
-	lim := NewLimiter(Limit(b.N), b.N)
-	ctx := context.Background()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		lim.WaitN(ctx, 1)
-	}
 }
 
 func Benchmark10RPS(b *testing.B) {
