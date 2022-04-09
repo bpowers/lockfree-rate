@@ -252,9 +252,9 @@ func runReserve(t *testing.T, lim *Limiter, req request) *Reservation {
 
 func runReserveMax(t *testing.T, lim *Limiter, req request, maxReserve time.Duration) *Reservation {
 	t.Helper()
-	r := lim.reserveN(req.t, req.n, maxReserve)
+	r := lim.reserve(req.t, req.n, maxReserve)
 	if r.ok && (dSince(r.timeToAct) != dSince(req.act)) || r.ok != req.ok {
-		t.Errorf("lim.reserveN(t%d, %v, %v) = (t%d, %v) want (t%d, %v)",
+		t.Errorf("lim.reserve(t%d, %v, %v) = (t%d, %v) want (t%d, %v)",
 			dSince(req.t), req.n, maxReserve, dSince(r.timeToAct), r.ok, dSince(req.act), req.ok)
 	}
 	return &r
@@ -361,7 +361,7 @@ func TestReserveSetLimit(t *testing.T) {
 
 	runReserve(t, lim, request{t0, 2, t0, true})
 	runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetLimitAt(t2, 10)
+	lim.setLimitAt(t2, 10)
 	runReserve(t, lim, request{t2, 1, t4, true}) // violates Limit and Burst
 }
 
@@ -370,7 +370,7 @@ func TestReserveSetBurst(t *testing.T) {
 
 	runReserve(t, lim, request{t0, 2, t0, true})
 	runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetBurstAt(t3, 4)
+	lim.setBurstAt(t3, 4)
 	runReserve(t, lim, request{t0, 4, t9, true}) // violates Limit and Burst
 }
 
@@ -379,7 +379,7 @@ func TestReserveSetLimitCancel(t *testing.T) {
 
 	runReserve(t, lim, request{t0, 2, t0, true})
 	r := runReserve(t, lim, request{t0, 2, t4, true})
-	lim.SetLimitAt(t2, 10)
+	lim.setLimitAt(t2, 10)
 	r.CancelAt(t2) // 2 tokens back
 	runReserve(t, lim, request{t2, 2, t3, true})
 }
