@@ -61,8 +61,6 @@ type Limiter struct {
 	tokens float64
 	// last is the last time the limiter's tokens field was updated
 	last time.Time
-	// lastEvent is the latest time of a rate-limited event (past or future)
-	lastEvent time.Time
 }
 
 // Limit returns the maximum overall event rate.
@@ -135,7 +133,6 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	if ok {
 		lim.last = now
 		lim.tokens = tokens
-		lim.lastEvent = now.Add(waitDuration)
 	} else {
 		lim.last = last
 	}
