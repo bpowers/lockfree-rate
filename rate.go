@@ -6,8 +6,9 @@
 package rate
 
 import (
+	"log"
 	"math"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +26,28 @@ func Every(interval time.Duration) Limit {
 		return Inf
 	}
 	return 1 / Limit(interval.Seconds())
+}
+
+type packedState uint64
+
+func newPackedState(timeMs int64, tokens int16) packedState {
+	return packedState((uint64(timeMs) << 13) | (0x1 << 12) | (uint64(uint16(tokens)) & 0xfff))
+}
+
+func (ps packedState) tokens() int16 {
+	return int16(ps & 0xfff)
+}
+
+func (ps packedState) timeMs() int64 {
+	return int64(ps >> 13)
+}
+
+func (ps packedState) ok() bool {
+	return ((ps >> 12) & 0x1) == 0x1
+}
+
+func (ps packedState) Unpack() (timeMs int64, tokens int16, ok bool) {
+	return ps.timeMs(), ps.tokens(), ps.ok()
 }
 
 // A Limiter controls how frequently events are allowed to happen.
@@ -51,22 +74,19 @@ func Every(interval time.Duration) Limit {
 //
 // The methods AllowN, ReserveN, and WaitN consume n tokens.
 type Limiter struct {
-	mu sync.Mutex
-
 	// static config
 	limit Limit
-	burst int
+	// mostly static, unless limit == 0 then atomically decremented
+	burst int64
 
-	// state
-	tokens float64
-	// last is the last time the limiter's tokens field was updated
-	last time.Time
+	state uint64 // packedState
+
+	// pad this Limiter struct to 64-bytes to avoid false sharing
+	_padding [64 - 24]byte
 }
 
 // Limit returns the maximum overall event rate.
 func (lim *Limiter) Limit() Limit {
-	lim.mu.Lock()
-	defer lim.mu.Unlock()
 	return lim.limit
 }
 
@@ -75,17 +95,21 @@ func (lim *Limiter) Limit() Limit {
 // Burst values allow more events to happen at once.
 // A zero Burst allows no events, unless limit == Inf.
 func (lim *Limiter) Burst() int {
-	lim.mu.Lock()
-	defer lim.mu.Unlock()
-	return lim.burst
+	burst := atomic.LoadInt64(&lim.burst)
+	return int(burst)
 }
 
 // NewLimiter returns a new Limiter that allows events up to rate r and permits
 // bursts of at most b tokens.
 func NewLimiter(r Limit, b int) *Limiter {
+	if b > maxTokens {
+		log.Printf("TODO: warn about this or something")
+		b = maxTokens
+	}
 	return &Limiter{
 		limit: r,
-		burst: b,
+		burst: int64(b),
+		state: uint64(newPackedState(0, int16(b))),
 	}
 }
 
@@ -97,54 +121,90 @@ func (lim *Limiter) Allow() bool {
 // InfDuration is the duration returned by Delay when a Reservation is not OK.
 const InfDuration = time.Duration(1<<63 - 1)
 
+func (lim *Limiter) loadState() packedState {
+	return packedState(atomic.LoadUint64(&lim.state))
+}
+
+// binnedNow is time.Now() with 1 microsecond precision (on linux its usually higher)
+func (lim *Limiter) binnedTime(now time.Time) int64 {
+	return now.UnixMicro()
+}
+
 // reserve is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 // reserve returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
 func (lim *Limiter) reserve(now time.Time) bool {
-	lim.mu.Lock()
-	defer lim.mu.Unlock()
-
 	if lim.limit == Inf {
 		return true
 	} else if lim.limit == 0 {
 		var ok bool
 		if lim.burst >= 1 {
-			ok = true
-			lim.burst--
+			newBurst := atomic.AddInt64(&lim.burst, -1)
+			ok = newBurst >= 0
 		}
 		return ok
 	}
 
-	now, last, tokens := lim.advance(now)
+	binnedNow := lim.binnedTime(now)
+	for i := 0; ; i++ {
+		currState := lim.loadState()
+		stateTime, tokens, ok := currState.Unpack()
+		if !ok {
+			// TODO: packed state is bad: either we had an underflow or first time
+			//       through and need to initialize
+			log.Printf("TODO: packed state is bad: either we had an underflow or first time through and need to initialize\n")
+			return false
+		}
 
-	// Calculate the remaining number of tokens resulting from the request.
-	tokens -= float64(1)
+		// check if we are in the current epoch (or the state's epoch
+		// is in the 'future', which we treat as == current)
+		if binnedNow == stateTime {
+			if tokens <= 0 {
+				// fail early to scale "obviously rate limited" traffic
+				return false
+			} else {
+				// there are tokens, and we're in the same epoch as currState
+				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
+				// TODO: is there sanity checking we should do around checking writeTime?
+				_, writeTokens, writeOk := newPackedState.Unpack()
+				if writeOk && writeTokens >= 0 {
+					return true
+				}
+			}
+		} else {
+			// slow path
 
-	// Calculate the wait duration
-	var waitDuration time.Duration
-	if tokens < 0 {
-		waitDuration = lim.limit.durationFromTokens(-tokens)
+			binnedNow, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
+			if tokens < 1 {
+				// if there are no tokens available, return
+				return false
+			}
+
+			// consume 1 token
+			tokens--
+
+			nextState := newPackedState(binnedNow, tokens)
+			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
+				// CAS worked (we won the race)
+				return true
+			}
+
+			// CAS failed (someone else won the race), fallthrough.  That means
+			// with high probability lim.state's time epoch is likely to be equal
+			// to our epoch in the next iteration, avoiding doing CAS two iterations
+			// in a row
+		}
 	}
-
-	// Decide result
-	ok := 1 <= lim.burst && waitDuration == 0
-
-	// Update state
-	if ok {
-		lim.last = now
-		lim.tokens = tokens
-	} else {
-		lim.last = last
-	}
-
-	return ok
 }
+
+const maxTokens = 1 << 15 // max int16
 
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
-func (lim *Limiter) advance(now time.Time) (newNow time.Time, newLast time.Time, newTokens float64) {
-	last := lim.last
+func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newNowMs int64, newTokens int16) {
+	now := time.UnixMicro(nowMs)
+	last := time.UnixMicro(lastMs)
 	if now.Before(last) {
 		last = now
 	}
@@ -152,11 +212,28 @@ func (lim *Limiter) advance(now time.Time) (newNow time.Time, newLast time.Time,
 	// Calculate the new number of tokens, due to time that passed.
 	elapsed := now.Sub(last)
 	delta := lim.limit.tokensFromDuration(elapsed)
-	tokens := lim.tokens + delta
-	if burst := float64(lim.burst); tokens > burst {
+
+	tokens := float64(oldTokens) + delta
+	if burst := float64(atomic.LoadInt64(&lim.burst)); tokens > burst {
 		tokens = burst
 	}
-	return now, last, tokens
+
+	wholeTokens := int64(tokens)
+	if wholeTokens > maxTokens {
+		wholeTokens = maxTokens
+	} else {
+		// if we don't adjust "now" we lose fractional tokens and rate limit
+		// at a substantially different rate than users specified.
+		remaining := tokens - float64(wholeTokens)
+		adjust := lim.limit.durationFromTokens(remaining)
+		newNow := now.Add(-adjust)
+		// this should never happen be triggered, but just in case ensure
+		// at least that the time tracked in lim.state doesn't go backwards.
+		if !newNow.Before(last) {
+			nowMs = newNow.UnixMicro()
+		}
+	}
+	return nowMs, int16(wholeTokens)
 }
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
