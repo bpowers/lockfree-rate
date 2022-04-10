@@ -31,19 +31,19 @@ func Every(interval time.Duration) Limit {
 type packedState uint64
 
 func newPackedState(timeMs int64, tokens int16) packedState {
-	return packedState((uint64(timeMs) << 20) | (0xf << 16) | uint64(uint16(tokens)))
+	return packedState((uint64(timeMs) << 13) | (0x1 << 12) | (uint64(uint16(tokens)) & 0xfff))
 }
 
 func (ps packedState) tokens() int16 {
-	return int16(ps & 0xffff)
+	return int16(ps & 0xfff)
 }
 
 func (ps packedState) timeMs() int64 {
-	return int64(ps >> 20)
+	return int64(ps >> 13)
 }
 
 func (ps packedState) ok() bool {
-	return ((ps >> 16) & 0xf) == 0xf
+	return ((ps >> 12) & 0x1) == 0x1
 }
 
 func (ps packedState) Unpack() (timeMs int64, tokens int16, ok bool) {
@@ -127,7 +127,7 @@ func (lim *Limiter) loadState() packedState {
 
 // binnedNow is time.Now() with 10ms precision
 func (lim *Limiter) binnedTime(now time.Time) int64 {
-	t := now.UnixMilli()
+	t := now.UnixMicro()
 	// return 10 * (t / 10)
 	return t
 }
@@ -141,14 +141,14 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	} else if lim.limit == 0 {
 		var ok bool
 		if lim.burst >= 1 {
-			oldBurst := atomic.AddInt64(&lim.burst, -1)
-			ok = oldBurst > 0
+			newBurst := atomic.AddInt64(&lim.burst, -1)
+			ok = newBurst >= 0
 		}
 		return ok
 	}
 
 	binnedNow := lim.binnedTime(now)
-	for {
+	for i := 0; ; i++ {
 		currState := lim.loadState()
 		stateTime, tokens, ok := currState.Unpack()
 		if !ok {
@@ -158,27 +158,33 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			return false
 		}
 
+		// log.Printf("%d tokens: %d\n", i, tokens)
+
 		// check if we are in the current epoch (or the state's epoch
 		// is in the 'future', which we treat as == current)
 		if binnedNow <= stateTime {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic
+				// log.Printf("%d tokens(%d) <= 0\n", i, tokens)
 				return false
 			} else {
 				// there are tokens, and we're in the same epoch as currState
-				prevPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
+				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
 				// TODO: is there sanity checking we should do around checking writeTime?
-				_, writeTokens, writeOk := prevPackedState.Unpack()
-				if writeOk && writeTokens > 0 {
+				_, writeTokens, writeOk := newPackedState.Unpack()
+				if writeOk && writeTokens >= 0 {
+					// log.Printf("%d dec succeeded (tokens at write were %d)\n", i, writeTokens)
 					return true
 				}
 			}
 		} else {
+			// log.Printf("  slow path\n")
 			// slow path
 
-			tokens := lim.advance(binnedNow, stateTime, int64(tokens))
+			binnedNow, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
 			if tokens < 1 {
 				// if there are no tokens available, return
+				// log.Printf("tokens < 1\n")
 				return false
 			}
 
@@ -188,12 +194,15 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			nextState := newPackedState(binnedNow, tokens)
 			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 				// CAS worked (we won the race)
+				// log.Printf("%d cas WON: %d tokens", i, tokens)
 				return true
 			}
+
 			// CAS failed (someone else won the race), fallthrough.  That means
 			// with high probability lim.state's time epoch is likely to be equal
 			// to our epoch in the next iteration, avoiding doing CAS two iterations
 			// in a row
+			// log.Printf("%d cas FAILED", i)
 		}
 	}
 }
@@ -203,9 +212,9 @@ const maxTokens = 1 << 15 // max int16
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
-func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newTokens int16) {
-	now := time.UnixMilli(nowMs)
-	last := time.UnixMilli(lastMs)
+func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newNowMs int64, newTokens int16) {
+	now := time.UnixMicro(nowMs)
+	last := time.UnixMicro(lastMs)
 	if now.Before(last) {
 		last = now
 	}
@@ -222,8 +231,12 @@ func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newTokens int
 	wholeTokens := int64(tokens)
 	if wholeTokens > maxTokens {
 		wholeTokens = maxTokens
+	} else {
+		remaining := tokens - float64(wholeTokens)
+		adjust := lim.limit.durationFromTokens(remaining)
+		nowMs = now.Add(-adjust).UnixMicro()
 	}
-	return int16(wholeTokens)
+	return nowMs, int16(wholeTokens)
 }
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
