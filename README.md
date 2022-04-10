@@ -1,19 +1,19 @@
-# Go Time
+# Lockfree version of the golang.org/x/time/rate.Limiter struct
 
-[![Go Reference](https://pkg.go.dev/badge/golang.org/x/time.svg)](https://pkg.go.dev/golang.org/x/time)
+[![Go Reference](https://pkg.go.dev/badge/bpowers/lockfree-rate.svg)](https://pkg.go.dev/bpowers/lockfree-rate)
 
-This repository provides supplementary Go time packages.
+This package provides a token bucket rate limiter supporting a subset of the [`rate.Limiter`](https://pkg.go.dev/golang.org/x/time/rate#Limiter) API that is up to 100x faster under contention.
+To accomplish this we only support the `Allow()` method.
 
-## Download/Install
+While performance of the original Limiter degraded under contention, this version scales linearly to at least 8 cores:
 
-The easiest way to install is to run `go get -u golang.org/x/time`. You can
-also manually git clone the repository to `$GOPATH/src/golang.org/x/time`.
+```
+$ benchstat old.txt new.txt
+name      old time/op    new time/op    delta
+AllowN      32.3ns ± 0%     3.4ns ± 0%  -89.41%  (p=0.002 n=6+6)
+AllowN-2    84.0ns ± 1%     1.8ns ± 0%  -97.90%  (p=0.002 n=6+6)
+AllowN-4     126ns ± 3%       1ns ± 0%  -99.28%  (p=0.004 n=5+6)
+AllowN-8     136ns ± 1%       0ns ± 0%  -99.66%  (p=0.004 n=5+6)
+```
 
-## Report Issues / Send Patches
 
-This repository uses Gerrit for code changes. To learn how to submit changes to
-this repository, see https://golang.org/doc/contribute.html.
-
-The main issue tracker for the time repository is located at
-https://github.com/golang/go/issues. Prefix your issue with "x/time:" in the
-subject line, so it is easy to find.
