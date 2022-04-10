@@ -125,11 +125,9 @@ func (lim *Limiter) loadState() packedState {
 	return packedState(atomic.LoadUint64(&lim.state))
 }
 
-// binnedNow is time.Now() with 10ms precision
+// binnedNow is time.Now() with 1 microsecond precision (on linux its usually higher)
 func (lim *Limiter) binnedTime(now time.Time) int64 {
-	t := now.UnixMicro()
-	// return 10 * (t / 10)
-	return t
+	return now.UnixMicro()
 }
 
 // reserve is a helper method for AllowN, ReserveN, and WaitN.
