@@ -28,26 +28,37 @@ func Every(interval time.Duration) Limit {
 	return 1 / Limit(interval.Seconds())
 }
 
+const timeShift = 19
+const sentinalShift = timeShift - 1
+const tokensMask = (1 << sentinalShift) - 1
+const maxTokens = tokensMask
+
 type packedState uint64
 
-func newPackedState(timeMs int64, tokens int16) packedState {
-	return packedState((uint64(timeMs) << 13) | (0x1 << 12) | (uint64(uint16(tokens)) & 0xfff))
+func newPackedState(newSinceBase int64, tokens int32) packedState {
+	if newSinceBase < 0 {
+		newSinceBase = 0
+	}
+	if tokens < 0 {
+		tokens = 0
+	}
+	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinalShift) | (uint64(tokens) & tokensMask))
 }
 
-func (ps packedState) tokens() int16 {
-	return int16(ps & 0xfff)
+func (ps packedState) tokens() int32 {
+	return int32(ps & tokensMask)
 }
 
-func (ps packedState) timeMs() int64 {
-	return int64(ps >> 13)
+func (ps packedState) timeMicros() int64 {
+	return int64(ps >> timeShift)
 }
 
 func (ps packedState) ok() bool {
-	return ((ps >> 12) & 0x1) == 0x1
+	return ((ps >> sentinalShift) & 0x1) == 0x1
 }
 
-func (ps packedState) Unpack() (timeMs int64, tokens int16, ok bool) {
-	return ps.timeMs(), ps.tokens(), ps.ok()
+func (ps packedState) Unpack() (sinceBase time.Duration, tokens int32, ok bool) {
+	return time.Duration(ps.timeMicros()) * time.Microsecond, ps.tokens(), ps.ok()
 }
 
 // A Limiter controls how frequently events are allowed to happen.
@@ -76,13 +87,16 @@ func (ps packedState) Unpack() (timeMs int64, tokens int16, ok bool) {
 type Limiter struct {
 	// static config
 	limit Limit
+
+	base time.Time
+
 	// mostly static, unless limit == 0 then atomically decremented
 	burst int64
 
 	state uint64 // packedState
 
 	// pad this Limiter struct to 64-bytes to avoid false sharing
-	_padding [64 - 24]byte
+	_padding [64 - 8 - 24 - 8 - 8]byte
 }
 
 // Limit returns the maximum overall event rate.
@@ -108,8 +122,9 @@ func NewLimiter(r Limit, b int) *Limiter {
 	}
 	return &Limiter{
 		limit: r,
+		base:  time.Now(),
 		burst: int64(b),
-		state: uint64(newPackedState(0, int16(b))),
+		state: uint64(newPackedState(0, int32(b))),
 	}
 }
 
@@ -148,13 +163,14 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	binnedNow := lim.binnedTime(now)
 	for i := 0; ; i++ {
 		currState := lim.loadState()
-		stateTime, tokens, ok := currState.Unpack()
+		sinceBase, tokens, ok := currState.Unpack()
 		if !ok {
 			// TODO: packed state is bad: either we had an underflow or first time
 			//       through and need to initialize
 			log.Printf("TODO: packed state is bad: either we had an underflow or first time through and need to initialize\n")
 			return false
 		}
+		stateTime := lim.base.Add(sinceBase).UnixMicro()
 
 		// check if we are in the current epoch (or the state's epoch
 		// is in the 'future', which we treat as == current)
@@ -174,7 +190,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		} else {
 			// slow path
 
-			binnedNow, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
+			newNowMicros, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
 			if tokens < 1 {
 				// if there are no tokens available, return
 				return false
@@ -183,7 +199,8 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			// consume 1 token
 			tokens--
 
-			nextState := newPackedState(binnedNow, tokens)
+			newSinceBase := newNowMicros - lim.base.UnixMicro()
+			nextState := newPackedState(newSinceBase, tokens)
 			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 				// CAS worked (we won the race)
 				return true
@@ -197,14 +214,12 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	}
 }
 
-const maxTokens = 1 << 15 // max int16
-
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
-func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newNowMs int64, newTokens int16) {
-	now := time.UnixMicro(nowMs)
-	last := time.UnixMicro(lastMs)
+func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64) (newNowMicros int64, newTokens int32) {
+	now := time.UnixMicro(nowMicros)
+	last := time.UnixMicro(lastMicros)
 	if now.Before(last) {
 		last = now
 	}
@@ -226,14 +241,14 @@ func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newNowMs int6
 		// at a substantially different rate than users specified.
 		remaining := tokens - float64(wholeTokens)
 		adjust := lim.limit.durationFromTokens(remaining)
-		newNow := now.Add(-adjust)
+		adjustedNow := now.Add(-adjust)
 		// this should never happen be triggered, but just in case ensure
 		// at least that the time tracked in lim.state doesn't go backwards.
-		if !newNow.Before(last) {
-			nowMs = newNow.UnixMicro()
+		if !adjustedNow.Before(last) {
+			nowMicros = adjustedNow.UnixMicro()
 		}
 	}
-	return nowMs, int16(wholeTokens)
+	return nowMicros, int32(wholeTokens)
 }
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration

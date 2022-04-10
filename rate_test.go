@@ -14,7 +14,23 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestSize(t *testing.T) {
+	if unsafe.Sizeof(Limiter{}) != 64 {
+		t.Errorf("expected limiter to by 64 bytes in size")
+	}
+}
+
+func TestShifting(t *testing.T) {
+	// 1 year + 1 microsecond in microseconds
+	const yearMicros = uint64((365*24*time.Hour + 1000) / time.Microsecond)
+
+	if (yearMicros<<timeShift)>>timeShift != yearMicros {
+		t.Errorf("timeShift too big to losslessly deal with our duration")
+	}
+}
 
 func TestLimit(t *testing.T) {
 	if Limit(10) == Inf {
