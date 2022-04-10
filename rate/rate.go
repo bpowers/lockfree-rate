@@ -158,14 +158,11 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			return false
 		}
 
-		// log.Printf("%d (%v) tokens: %d\n", i, time.UnixMicro(binnedNow), tokens)
-
 		// check if we are in the current epoch (or the state's epoch
 		// is in the 'future', which we treat as == current)
 		if binnedNow == stateTime {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic
-				// log.Printf("%d tokens(%d) <= 0\n", i, tokens)
 				return false
 			} else {
 				// there are tokens, and we're in the same epoch as currState
@@ -173,19 +170,15 @@ func (lim *Limiter) reserve(now time.Time) bool {
 				// TODO: is there sanity checking we should do around checking writeTime?
 				_, writeTokens, writeOk := newPackedState.Unpack()
 				if writeOk && writeTokens >= 0 {
-					// log.Printf("%d dec succeeded (tokens at write were %d)\n", i, writeTokens)
 					return true
 				}
-				// log.Printf("%d dec failed\n", i)
 			}
 		} else {
-			// log.Printf("  slow path\n")
 			// slow path
 
 			binnedNow, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
 			if tokens < 1 {
 				// if there are no tokens available, return
-				// log.Printf("tokens < 1\n")
 				return false
 			}
 
@@ -195,7 +188,6 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			nextState := newPackedState(binnedNow, tokens)
 			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 				// CAS worked (we won the race)
-				// log.Printf("%d cas WON: %d tokens", i, tokens)
 				return true
 			}
 
@@ -203,7 +195,6 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			// with high probability lim.state's time epoch is likely to be equal
 			// to our epoch in the next iteration, avoiding doing CAS two iterations
 			// in a row
-			// log.Printf("%d cas FAILED", i)
 		}
 	}
 }
