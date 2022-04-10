@@ -158,11 +158,11 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			return false
 		}
 
-		// log.Printf("%d tokens: %d\n", i, tokens)
+		// log.Printf("%d (%v) tokens: %d\n", i, time.UnixMicro(binnedNow), tokens)
 
 		// check if we are in the current epoch (or the state's epoch
 		// is in the 'future', which we treat as == current)
-		if binnedNow <= stateTime {
+		if binnedNow == stateTime {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic
 				// log.Printf("%d tokens(%d) <= 0\n", i, tokens)
@@ -176,6 +176,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 					// log.Printf("%d dec succeeded (tokens at write were %d)\n", i, writeTokens)
 					return true
 				}
+				// log.Printf("%d dec failed\n", i)
 			}
 		} else {
 			// log.Printf("  slow path\n")
@@ -232,9 +233,16 @@ func (lim *Limiter) advance(nowMs, lastMs int64, oldTokens int64) (newNowMs int6
 	if wholeTokens > maxTokens {
 		wholeTokens = maxTokens
 	} else {
+		// if we don't adjust "now" we lose fractional tokens and rate limit
+		// at a substantially different rate than users specified.
 		remaining := tokens - float64(wholeTokens)
 		adjust := lim.limit.durationFromTokens(remaining)
-		nowMs = now.Add(-adjust).UnixMicro()
+		newNow := now.Add(-adjust)
+		// this should never happen be triggered, but just in case ensure
+		// at least that the time tracked in lim.state doesn't go backwards.
+		if !newNow.Before(last) {
+			nowMs = newNow.UnixMicro()
+		}
 	}
 	return nowMs, int16(wholeTokens)
 }
