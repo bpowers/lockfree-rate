@@ -257,15 +257,20 @@ func dSince(t time.Time) int {
 }
 
 func BenchmarkAllowN(b *testing.B) {
-	lim := NewLimiter(Every(1*time.Second), 1)
+	var numOK = uint64(0)
+
+	lim := NewLimiter(2000, 50)
 	now := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			lim.reserve(now)
+			if lim.reserve(now) {
+				atomic.AddUint64(&numOK, 1)
+			}
 		}
 	})
+	b.Logf("allowed %d requests through", atomic.LoadUint64(&numOK))
 }
 
 func TestZeroLimit(t *testing.T) {
