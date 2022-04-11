@@ -151,7 +151,9 @@ func (lim *Limiter) reinit(nowMicros int64) {
 		newBase := time.UnixMicro(nowMicros).Add(-(7 * 24 * time.Hour)).UnixMicro()
 		atomic.StoreInt64(&lim.baseMicros, newBase)
 
-		atomic.StoreUint64(&lim.state, uint64(newPackedState(0, int32(lim.Burst()))))
+		sinceBase := nowMicros - newBase
+
+		atomic.StoreUint64(&lim.state, uint64(newPackedState(sinceBase, int32(lim.Burst()))))
 	}
 }
 
