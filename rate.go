@@ -127,6 +127,8 @@ func NewLimiter(r Limit, b int) *Limiter {
 		burst: int64(b),
 	}
 
+	l.reinit(time.Now().UnixMicro())
+
 	return l
 }
 
