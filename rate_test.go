@@ -289,11 +289,33 @@ func BenchmarkAllowN(b *testing.B) {
 	b.Logf("allowed %d requests through", atomic.LoadUint64(&numOK))
 }
 
-func BenchmarkMediumLimit(b *testing.B) {
+func Benchmark10RPS(b *testing.B) {
+	benchmarkRPS(b, 10, 1)
+}
+
+func Benchmark100RPS(b *testing.B) {
+	benchmarkRPS(b, 100, 1)
+}
+
+func Benchmark1000RPS(b *testing.B) {
+	benchmarkRPS(b, 1000, 1)
+}
+
+func Benchmark10000RPS(b *testing.B) {
+	benchmarkRPS(b, 10000, 1)
+}
+
+func Benchmark100000RPS(b *testing.B) {
+	benchmarkRPS(b, 100000, 1)
+}
+
+func benchmarkRPS(b *testing.B, rate Limit, burst int) {
+	b.Helper()
+
 	var total = uint64(0)
 	var numOK = uint64(0)
 
-	lim := NewLimiter(1000, 1)
+	lim := NewLimiter(rate, burst)
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -309,30 +331,11 @@ func BenchmarkMediumLimit(b *testing.B) {
 	d := time.Now().Sub(start)
 	ok := atomic.LoadUint64(&numOK)
 	tot := atomic.LoadUint64(&total)
-	b.Logf("RPS: %f -- allowed %d/%d (%.3f%%) requests through in %v", float64(ok)/(float64(d)/float64(time.Second)), ok, tot, 100*float64(ok)/float64(tot), d)
-}
-
-func BenchmarkHighLimit(b *testing.B) {
-	var total = uint64(0)
-	var numOK = uint64(0)
-
-	lim := NewLimiter(10000, 1)
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	start := time.Now()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			if lim.reserve(time.Now()) {
-				atomic.AddUint64(&numOK, 1)
-			}
-			atomic.AddUint64(&total, 1)
-		}
-	})
-	d := time.Now().Sub(start)
-	ok := atomic.LoadUint64(&numOK)
-	tot := atomic.LoadUint64(&total)
-	b.Logf("RPS: %f -- allowed %d/%d (%.3f%%) requests through in %v", float64(ok)/(float64(d)/float64(time.Second)), ok, tot, 100*float64(ok)/float64(tot), d)
+	allowedRPS := float64(ok) / (float64(d) / float64(time.Second))
+	overallRPS := float64(tot) / (float64(d) / float64(time.Second))
+	if d > 1*time.Second {
+		b.Logf("%.1f RPS allowed, %.1f RPS overall. %.3f%% of %d requests in %v", allowedRPS, overallRPS, 100*float64(ok)/float64(tot), tot, d)
+	}
 }
 
 func TestZeroLimit(t *testing.T) {
