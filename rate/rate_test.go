@@ -515,6 +515,99 @@ func BenchmarkWaitNNoDelay(b *testing.B) {
 	}
 }
 
+func Benchmark10RPS(b *testing.B) {
+	benchmarkRPS(b, 10, 1)
+}
+
+func Benchmark100RPS(b *testing.B) {
+	benchmarkRPS(b, 100, 1)
+}
+
+func Benchmark1000RPS(b *testing.B) {
+	benchmarkRPS(b, 1000, 1)
+}
+
+func Benchmark10000RPS(b *testing.B) {
+	benchmarkRPS(b, 10000, 1)
+}
+
+func Benchmark100000RPS(b *testing.B) {
+	benchmarkRPS(b, 100000, 1)
+}
+
+func benchmarkRPS(b *testing.B, rate Limit, burst int) {
+	b.Helper()
+
+	var total = uint64(0)
+	var numOK = uint64(0)
+
+	lim := NewLimiter(rate, burst)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		localOK := uint64(0)
+		localTotal := uint64(0)
+
+		for pb.Next() {
+			if lim.Allow() {
+				localOK++
+			}
+			localTotal++
+		}
+
+		atomic.AddUint64(&numOK, localOK)
+		atomic.AddUint64(&total, localTotal)
+	})
+
+	d := time.Now().Sub(start)
+	if d > 1*time.Second {
+		ok := atomic.LoadUint64(&numOK)
+		tot := atomic.LoadUint64(&total)
+		allowedRPS := float64(ok) / (float64(d) / float64(time.Second))
+		overallRPS := float64(tot) / (float64(d) / float64(time.Second))
+		b.Logf("%.1f RPS allowed, %.1f RPS overall. %.3f%% of %d requests in %v", allowedRPS, overallRPS, 100*float64(ok)/float64(tot), tot, d)
+	}
+}
+
+// global var so the comparison below can't be optimized away
+var Then int64
+
+func Benchmark1RPS(b *testing.B) {
+	var total = uint64(0)
+	var numOK = uint64(0)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		localOK := uint64(0)
+		localTotal := uint64(0)
+
+		for pb.Next() {
+			if time.Now().UnixMicro() > Then {
+				localOK++
+			}
+			localTotal++
+		}
+
+		atomic.AddUint64(&numOK, localOK)
+		atomic.AddUint64(&total, localTotal)
+	})
+
+	d := time.Now().Sub(start)
+	if d > 1*time.Second {
+		ok := atomic.LoadUint64(&numOK)
+		tot := atomic.LoadUint64(&total)
+		allowedRPS := float64(ok) / (float64(d) / float64(time.Second))
+		overallRPS := float64(tot) / (float64(d) / float64(time.Second))
+		b.Logf("%.1f RPS allowed, %.1f RPS overall. %.3f%% of %d requests in %v", allowedRPS, overallRPS, 100*float64(ok)/float64(tot), tot, d)
+	}
+}
+
 func TestZeroLimit(t *testing.T) {
 	r := NewLimiter(0, 1)
 	if !r.Allow() {
