@@ -188,7 +188,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	}
 
 	binnedNow := lim.binnedTime(now)
-	for i := 0; ; i++ {
+	for {
 		base := atomic.LoadInt64(&lim.baseMicros)
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
