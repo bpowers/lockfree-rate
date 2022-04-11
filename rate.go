@@ -135,15 +135,22 @@ func (lim *Limiter) reinit(nowMicros int64) {
 	lim.baseWriteMu.Lock()
 	defer lim.baseWriteMu.Unlock()
 
-	// poison the state
-	atomic.StoreUint64(&lim.state, 0)
+	base := atomic.LoadInt64(&lim.baseMicros)
+	state := lim.loadState()
+	// recheck that things look wonky with the lock held -- someone else could have
+	// won the lock race and fixed it for us.
+	if !state.ok() || base == 0 || nowMicros < base {
+		// poison the state, try to get other threads we are racing with to call reinit
+		atomic.StoreUint64(&lim.state, 0)
 
-	// this is pretty wishy washy -- this store can be observed without observing
-	// the state poisoning above.
-	newBase := time.UnixMicro(nowMicros).Add(-(7 * 24 * time.Hour)).UnixMicro()
-	atomic.StoreInt64(&lim.baseMicros, newBase)
+		// this is pretty wishy washy -- I think this store can be observed without
+		// observing the state poisoning above.  The point/hope of the lock here is
+		// to serialize with other threads also observing the wonkiness.
+		newBase := time.UnixMicro(nowMicros).Add(-(7 * 24 * time.Hour)).UnixMicro()
+		atomic.StoreInt64(&lim.baseMicros, newBase)
 
-	atomic.StoreUint64(&lim.state, uint64(newPackedState(0, int32(lim.burst))))
+		atomic.StoreUint64(&lim.state, uint64(newPackedState(0, int32(lim.Burst()))))
+	}
 }
 
 // Allow is shorthand for AllowN(time.Now(), 1).
