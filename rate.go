@@ -8,6 +8,7 @@ package rate
 import (
 	"log"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -57,8 +58,8 @@ func (ps packedState) ok() bool {
 	return ((ps >> sentinalShift) & 0x1) == 0x1
 }
 
-func (ps packedState) Unpack() (sinceBase time.Duration, tokens int32, ok bool) {
-	return time.Duration(ps.timeMicros()) * time.Microsecond, ps.tokens(), ps.ok()
+func (ps packedState) Unpack() (sinceBaseMicros int64, tokens int32, ok bool) {
+	return ps.timeMicros(), ps.tokens(), ps.ok()
 }
 
 // A Limiter controls how frequently events are allowed to happen.
@@ -88,7 +89,8 @@ type Limiter struct {
 	// static config
 	limit Limit
 
-	base time.Time
+	baseWriteMu sync.Mutex
+	baseMicros  int64
 
 	// mostly static, unless limit == 0 then atomically decremented
 	burst int64
@@ -96,7 +98,7 @@ type Limiter struct {
 	state uint64 // packedState
 
 	// pad this Limiter struct to 64-bytes to avoid false sharing
-	_padding [64 - 8 - 24 - 8 - 8]byte
+	_padding [64 - 8 - 8 - 8 - 8 - 8]byte
 }
 
 // Limit returns the maximum overall event rate.
@@ -120,12 +122,28 @@ func NewLimiter(r Limit, b int) *Limiter {
 		log.Printf("TODO: warn about this or something")
 		b = maxTokens
 	}
-	return &Limiter{
+	l := &Limiter{
 		limit: r,
-		base:  time.Now(),
 		burst: int64(b),
-		state: uint64(newPackedState(0, int32(b))),
 	}
+
+	return l
+}
+
+//go:noinline
+func (lim *Limiter) reinit(nowMicros int64) {
+	lim.baseWriteMu.Lock()
+	defer lim.baseWriteMu.Unlock()
+
+	// poison the state
+	atomic.StoreUint64(&lim.state, 0)
+
+	// this is pretty wishy washy -- this store can be observed without observing
+	// the state poisoning above.
+	newBase := time.UnixMicro(nowMicros).Add(-(7 * 24 * time.Hour)).UnixMicro()
+	atomic.StoreInt64(&lim.baseMicros, newBase)
+
+	atomic.StoreUint64(&lim.state, uint64(newPackedState(0, int32(lim.burst))))
 }
 
 // Allow is shorthand for AllowN(time.Now(), 1).
@@ -162,15 +180,21 @@ func (lim *Limiter) reserve(now time.Time) bool {
 
 	binnedNow := lim.binnedTime(now)
 	for i := 0; ; i++ {
+		base := atomic.LoadInt64(&lim.baseMicros)
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
 		if !ok {
-			// TODO: packed state is bad: either we had an underflow or first time
-			//       through and need to initialize
-			log.Printf("TODO: packed state is bad: either we had an underflow or first time through and need to initialize\n")
-			return false
+			lim.reinit(binnedNow)
+			continue
 		}
-		stateTime := lim.base.Add(sinceBase).UnixMicro()
+
+		if binnedNow < base {
+			// time jumped backwards a lot; do our best
+			lim.reinit(binnedNow)
+			continue
+		}
+
+		stateTime := base + sinceBase
 
 		// check if we are in the current epoch (or the state's epoch
 		// is in the 'future', which we treat as == current)
@@ -199,7 +223,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			// consume 1 token
 			tokens--
 
-			newSinceBase := newNowMicros - lim.base.UnixMicro()
+			newSinceBase := newNowMicros - base
 			nextState := newPackedState(newSinceBase, tokens)
 			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 				// CAS worked (we won the race)
