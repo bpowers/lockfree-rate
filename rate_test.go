@@ -289,6 +289,28 @@ func BenchmarkAllowN(b *testing.B) {
 	b.Logf("allowed %d requests through", atomic.LoadUint64(&numOK))
 }
 
+func BenchmarkHighLimit(b *testing.B) {
+	var total = uint64(0)
+	var numOK = uint64(0)
+
+	lim := NewLimiter(10000, 5000)
+	now := time.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	start := time.Now()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if lim.reserve(now) {
+				atomic.AddUint64(&numOK, 1)
+			}
+			atomic.AddUint64(&total, 1)
+		}
+	})
+	d := time.Now().Sub(start)
+	b.Logf("allowed %d requests through in %v", atomic.LoadUint64(&numOK), d)
+}
+
 func TestZeroLimit(t *testing.T) {
 	r := NewLimiter(0, 1)
 	if !r.Allow() {
