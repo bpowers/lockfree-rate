@@ -31,7 +31,8 @@ func Every(interval time.Duration) Limit {
 
 const timeShift = 19
 const sentinelShift = timeShift - 1
-const tokensMask = (1 << sentinelShift) - 1
+const catchUnderflowShift = sentinelShift - 1
+const tokensMask = (1 << catchUnderflowShift) - 1
 const maxTokens = tokensMask
 
 type packedState uint64
@@ -43,11 +44,14 @@ func newPackedState(newSinceBase int64, tokens int32) packedState {
 	if tokens < 0 {
 		tokens = 0
 	}
-	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinelShift) | (uint64(tokens) & tokensMask))
+	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinelShift) | (0x1 << catchUnderflowShift) | (uint64(tokens) & tokensMask))
 }
 
 func (ps packedState) tokens() int32 {
-	return int32(ps & tokensMask)
+	tokens := int32(ps & tokensMask)
+	// do this shift dance after we've masked to left-fill 1s in the case of a
+	// transition from 0 -> -1.  Check out TestUnderflow for details.
+	return (tokens << (32 - catchUnderflowShift)) >> (32 - catchUnderflowShift)
 }
 
 func (ps packedState) timeMicros() int64 {

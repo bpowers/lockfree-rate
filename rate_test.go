@@ -32,6 +32,27 @@ func TestShifting(t *testing.T) {
 	}
 }
 
+func TestUnderflow(t *testing.T) {
+	s := uint64(newPackedState(0, 0))
+
+	// -1 in uint64-speak
+	atomic.AddUint64(&s, ^uint64(0))
+
+	lastUpdate, toks, ok := packedState(s).Unpack()
+
+	if toks != -1 {
+		t.Fatalf("expected toks to be -1 not %d", toks)
+	}
+
+	if !ok {
+		t.Fatalf("expected undeflow to be ok")
+	}
+
+	if lastUpdate != 0 {
+		t.Fatalf("expected lastUpdate to be un-affected")
+	}
+}
+
 func TestLimit(t *testing.T) {
 	if Limit(10) == Inf {
 		t.Errorf("Limit(10) == Inf should be false")
