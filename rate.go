@@ -190,6 +190,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	}
 
 	nowMicros := now.UnixMicro()
+	maxBurst := atomic.LoadInt64(&lim.burst)
 	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
 	for i := 0; i < 1024; i++ {
@@ -211,7 +212,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			return false
 		}
 
-		newNowMicros, tokens := lim.advance(nowMicros, stateTime, int64(tokens))
+		newNowMicros, tokens := lim.advance(nowMicros, stateTime, int64(tokens), maxBurst)
 		if tokens < 1 {
 			// if there are no tokens available, return
 			return false
@@ -233,44 +234,51 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		// in a row
 	}
 
-	// the above loop should be executed 1-2 times, meaning we should never reach here.
-	// (never seen in tests!).  If we do reach here, we're in a Weird situation, so fail open.
+	// The above loop should be executed 1-2 times before one of the return statements is triggered.
+	// We've never seen in tests this fallthrough get hit!  But to avoid some degenerate/unicorn case
+	// that causes the logic above to loop forever, we limit the times through the loop.  If we do
+	// reach here, we're in a Super Weird situation, so fail open.
 	return true
 }
 
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
-func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64) (newNowMicros int64, newTokens int32) {
+func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64, maxBurst int64) (newNowMicros int64, newTokens int32) {
+	// in the event of a time jump _or_ another goroutine winning the CAS race,
+	// lastMicros may be in the future!
 	if nowMicros < lastMicros {
 		lastMicros = nowMicros
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
-	elapsed := time.Duration((nowMicros - lastMicros) * 1000)
+	elapsed := time.Duration(nowMicros-lastMicros) * time.Microsecond
 	delta := lim.limit.tokensFromDuration(elapsed)
 
+	// if a long time has passed we may have a lot of tokens available -- clamp
+	// it down to the max burst we've configured. The constructor ensures
+	// `maxBurst <= maxTokens`
 	tokens := float64(oldTokens) + delta
-	if burst := float64(atomic.LoadInt64(&lim.burst)); tokens > burst {
+	if burst := float64(maxBurst); tokens > burst {
 		tokens = burst
 	}
 
-	wholeTokens := int64(tokens)
-	if wholeTokens > maxTokens {
-		wholeTokens = maxTokens
-	} else {
-		// if we don't adjust "now" we lose fractional tokens and rate limit
-		// at a substantially different rate than users specified.
-		remaining := tokens - float64(wholeTokens)
-		adjustMicros := lim.limit.durationFromTokens(remaining) / time.Microsecond
-		adjustedNow := nowMicros - int64(adjustMicros)
-		// this should never happen be triggered, but just in case ensure
-		// at least that the time tracked in lim.state doesn't go backwards.
-		if adjustedNow >= lastMicros {
-			nowMicros = adjustedNow
-		}
+	wholeTokens := int32(tokens)
+
+	// if we don't adjust "now" we lose fractional tokens and rate limit
+	// at a substantially different rate than users specified.
+	remaining := tokens - float64(wholeTokens)
+	adjustMicros := lim.limit.durationFromTokens(remaining) / time.Microsecond
+	adjustedNow := nowMicros - int64(adjustMicros)
+
+	// this should always be true, but just in case ensure that the time
+	// tracked in lim.state doesn't go backwards.  An always-taken branch
+	// is ~ free.
+	if adjustedNow >= lastMicros {
+		nowMicros = adjustedNow
 	}
-	return nowMicros, int32(wholeTokens)
+
+	return nowMicros, wholeTokens
 }
 
 // durationFromTokens is a unit conversion function from the number of tokens to the duration
