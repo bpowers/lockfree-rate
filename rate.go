@@ -29,7 +29,7 @@ func Every(interval time.Duration) Limit {
 	return 1 / Limit(interval.Seconds())
 }
 
-const timeShift = 19
+const timeShift = 20
 const sentinelShift = timeShift - 1
 const catchUnderflowShift = sentinelShift - 1
 const tokensMask = (1 << catchUnderflowShift) - 1
@@ -212,10 +212,28 @@ func (lim *Limiter) reserve(now time.Time) bool {
 
 		stateTime := baseMicros + sinceBase
 
-		if nowMicros == stateTime && tokens <= 0 {
-			// fail early to scale "obviously rate limited" traffic.  Under load this
-			// is the main branch taken and happens in the first iteration of the loop.
-			return false
+		if nowMicros == stateTime {
+			if tokens <= 0 {
+				// fail early to scale "obviously rate limited" traffic.  Under load this
+				// is the main branch taken and happens in the first iteration of the loop.
+				return false
+			} else {
+				// there are tokens, and we're in the same epoch as currState.  race-ily
+				// decrement the state and check if we won the race.  Because we treat
+				// token count as a signed integer and always set an extra `1` bit just
+				// to the left of token count, if we drop below 0 tokens here when racing
+				// it is fine.
+				//
+				// This branch is mostly hit if we have burst capacity and a bunch of
+				// concurrent requests coming in at once.
+				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
+				_, writeTokens, writeOk := newPackedState.Unpack()
+				if writeOk && writeTokens >= 0 {
+				   return true
+				}
+				// if we failed start the loop over to reload + re-extract state
+				continue
+			}
 		}
 
 		newNowMicros, tokens := advance(limit, nowMicros, stateTime, int64(tokens), maxBurst)
@@ -255,6 +273,12 @@ func advance(lim Limit, nowMicros, lastMicros int64, oldTokens int64, maxBurst i
 	// lastMicros may be in the future!
 	if nowMicros < lastMicros {
 		lastMicros = nowMicros
+	}
+
+	// we may observe a race-y underflow from the non-CAS atomic decrement in the loop above,
+	// correct it here.
+	if oldTokens < 0 {
+		oldTokens = 0
 	}
 
 	// Calculate the new number of tokens, due to time that passed.

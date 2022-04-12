@@ -24,8 +24,8 @@ func TestSize(t *testing.T) {
 }
 
 func TestShifting(t *testing.T) {
-	// 1 year + 1 microsecond in microseconds
-	const yearMicros = uint64((365*24*time.Hour + 1000) / time.Microsecond)
+	// half year + 1 microsecond in microseconds
+	const yearMicros = uint64((180*24*time.Hour + 1000) / time.Microsecond)
 
 	if (yearMicros<<timeShift)>>timeShift != yearMicros {
 		t.Errorf("timeShift too big to losslessly deal with our duration")
@@ -373,7 +373,7 @@ func BenchmarkBurstRPS(b *testing.B) {
 	var total = uint64(0)
 	var numOK = uint64(0)
 
-	lim := NewLimiter(50000, 50000)
+	lim := NewLimiter(100000, 100000)
 
 	b.ReportAllocs()
 	b.ResetTimer()
