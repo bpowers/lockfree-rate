@@ -33,7 +33,7 @@ const timeShift = 20
 const sentinelShift = timeShift - 1
 const catchUnderflowShift = sentinelShift - 1
 const tokensMask = (1 << catchUnderflowShift) - 1
-const maxTokens = tokensMask
+const maxTokens = (1 << (catchUnderflowShift - 1)) - 1
 
 type packedState uint64
 
