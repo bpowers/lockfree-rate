@@ -210,9 +210,17 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			continue
 		}
 
-		stateTime := baseMicros + sinceBase
+		lastUpdateMicros := baseMicros + sinceBase
 
-		if nowMicros == stateTime {
+		// CPUs are fast, so "binning" time to microseconds (1,000 nanoseconds,
+		// 1/1,000 of a millisecond) leaves us with a pretty coarse grained measure
+		// of advancing time (more like a staircase than a sloped hill).  Consequently,
+		// if there is a lot of traffic for this rate limiter we expect last update to
+		// be equal to now micros most of the time (especially if we are on the second
+		// iteration of this loop, having just lost the CAS race to another goroutine).
+		// Handling this case separately, first, gives us a fast path that reduces
+		// contention and helps us scale.
+		if nowMicros == lastUpdateMicros {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic.  Under load this
 				// is the main branch taken and happens in the first iteration of the loop.
@@ -228,11 +236,13 @@ func (lim *Limiter) reserve(now time.Time) bool {
 				// concurrent requests coming in at once.
 				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
 				_, writeTokens, writeOk := newPackedState.Unpack()
+				// if write tokens is 0, it means that our write was the one that
+				// decremented tokens from 1 to 0.  We count that as a win!
 				return writeOk && writeTokens >= 0
 			}
 		}
 
-		newNowMicros, tokens := advance(limit, nowMicros, stateTime, int64(tokens), maxBurst)
+		newNowMicros, tokens := advance(limit, nowMicros, lastUpdateMicros, int64(tokens), maxBurst)
 		if tokens < 1 {
 			// if there are no tokens available, return
 			return false
