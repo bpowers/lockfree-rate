@@ -228,11 +228,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 				// concurrent requests coming in at once.
 				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
 				_, writeTokens, writeOk := newPackedState.Unpack()
-				if writeOk && writeTokens >= 0 {
-				   return true
-				}
-				// if we failed start the loop over to reload + re-extract state
-				continue
+				return writeOk && writeTokens >= 0
 			}
 		}
 
