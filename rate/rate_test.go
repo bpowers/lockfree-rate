@@ -328,7 +328,9 @@ func benchmarkRPS(b *testing.B, rate Limit, burst int) {
 // global var so the comparison below can't be optimized away
 var Then int64
 
-func Benchmark1RPS(b *testing.B) {
+// this tests the absolute minimum time a call to Accept() (which internally
+// calls time.Now) could take.
+func BenchmarkTimeNow(b *testing.B) {
 	var total = uint64(0)
 	var numOK = uint64(0)
 
