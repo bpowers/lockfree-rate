@@ -30,8 +30,8 @@ func Every(interval time.Duration) Limit {
 }
 
 const timeShift = 19
-const sentinalShift = timeShift - 1
-const tokensMask = (1 << sentinalShift) - 1
+const sentinelShift = timeShift - 1
+const tokensMask = (1 << sentinelShift) - 1
 const maxTokens = tokensMask
 
 type packedState uint64
@@ -43,7 +43,7 @@ func newPackedState(newSinceBase int64, tokens int32) packedState {
 	if tokens < 0 {
 		tokens = 0
 	}
-	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinalShift) | (uint64(tokens) & tokensMask))
+	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinelShift) | (uint64(tokens) & tokensMask))
 }
 
 func (ps packedState) tokens() int32 {
@@ -55,7 +55,7 @@ func (ps packedState) timeMicros() int64 {
 }
 
 func (ps packedState) ok() bool {
-	return ((ps >> sentinalShift) & 0x1) == 0x1
+	return ((ps >> sentinelShift) & 0x1) == 0x1
 }
 
 func (ps packedState) Unpack() (sinceBaseMicros int64, tokens int32, ok bool) {
@@ -192,7 +192,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	nowMicros := now.UnixMicro()
 	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
-	for i := 0; i < 256; i++ {
+	for i := 0; i < 1024; i++ {
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
 		if !ok || nowMicros < baseMicros {
@@ -205,22 +205,10 @@ func (lim *Limiter) reserve(now time.Time) bool {
 
 		stateTime := baseMicros + sinceBase
 
-		if nowMicros == stateTime {
-			if tokens <= 0 {
-				// fail early to scale "obviously rate limited" traffic.  Under load this
-				// is the main branch taken
-				return false
-			} else {
-				// there are tokens, and we're in the same epoch as currState
-				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
-				_, writeTokens, writeOk := newPackedState.Unpack()
-				if writeOk && writeTokens >= 0 {
-					// fmt.Printf("bonus\n")
-					return true
-				}
-				// if we failed, start the loop over
-				continue
-			}
+		if nowMicros == stateTime && tokens <= 0 {
+			// fail early to scale "obviously rate limited" traffic.  Under load this
+			// is the main branch taken and happens in the first iteration of the loop.
+			return false
 		}
 
 		newNowMicros, tokens := lim.advance(nowMicros, stateTime, int64(tokens))
