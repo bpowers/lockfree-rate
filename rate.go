@@ -124,7 +124,7 @@ func (lim *Limiter) Burst() int {
 // bursts of at most b tokens.
 func NewLimiter(r Limit, b int) *Limiter {
 	if b > maxTokens {
-		log.Printf("TODO: warn about this or something")
+		log.Printf("rate.NewLimiter: burst %d bigger than max %d, using %d", b, maxTokens, maxTokens)
 		b = maxTokens
 	}
 	l := &Limiter{
