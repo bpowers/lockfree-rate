@@ -190,7 +190,8 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	}
 
 	binnedNow := lim.binnedTime(now)
-	for {
+
+	for i := 0; i < 256; i++ {
 		base := atomic.LoadInt64(&lim.baseMicros)
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
@@ -216,7 +217,6 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			} else {
 				// there are tokens, and we're in the same epoch as currState
 				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
-				// TODO: is there sanity checking we should do around checking writeTime?
 				_, writeTokens, writeOk := newPackedState.Unpack()
 				if writeOk && writeTokens >= 0 {
 					return true
@@ -247,20 +247,22 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			// in a row
 		}
 	}
+
+	// the above loop should be executed 1-2 times, meaning we should never reach here.
+	// (never seen in tests!).  If we do reach here, we're in a Weird situation, so fail open.
+	return true
 }
 
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
 func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64) (newNowMicros int64, newTokens int32) {
-	now := time.UnixMicro(nowMicros)
-	last := time.UnixMicro(lastMicros)
-	if now.Before(last) {
-		last = now
+	if nowMicros < lastMicros {
+		lastMicros = nowMicros
 	}
 
 	// Calculate the new number of tokens, due to time that passed.
-	elapsed := now.Sub(last)
+	elapsed := time.Duration((nowMicros - lastMicros) * 1000)
 	delta := lim.limit.tokensFromDuration(elapsed)
 
 	tokens := float64(oldTokens) + delta
@@ -275,12 +277,12 @@ func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64) (newNo
 		// if we don't adjust "now" we lose fractional tokens and rate limit
 		// at a substantially different rate than users specified.
 		remaining := tokens - float64(wholeTokens)
-		adjust := lim.limit.durationFromTokens(remaining)
-		adjustedNow := now.Add(-adjust)
+		adjustMicros := lim.limit.durationFromTokens(remaining) / time.Microsecond
+		adjustedNow := nowMicros - int64(adjustMicros)
 		// this should never happen be triggered, but just in case ensure
 		// at least that the time tracked in lim.state doesn't go backwards.
-		if !adjustedNow.Before(last) {
-			nowMicros = adjustedNow.UnixMicro()
+		if adjustedNow >= lastMicros {
+			nowMicros = adjustedNow
 		}
 	}
 	return nowMicros, int32(wholeTokens)
