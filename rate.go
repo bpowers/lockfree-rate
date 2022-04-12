@@ -89,6 +89,11 @@ type Limiter struct {
 	// static config
 	limit Limit
 
+	// to ensure we can pack larger burst values into state, split `lastUpdated`
+	// between baseMicros and a smaller microsecond-based difference packed into
+	// `state`.  Effectively `lastUpdate := lim.baseMicros + lim.state.timeMicros()`.
+	// We keep a mutex here so that if there is a _large_ time correction we
+	// synchronize while rebasing baseMicros.
 	baseWriteMu sync.Mutex
 	baseMicros  int64
 
@@ -142,10 +147,10 @@ func (lim *Limiter) reinit(nowMicros int64) {
 	// recheck that things look wonky with the lock held -- someone else could have
 	// won the lock race and fixed it for us.
 	if !state.ok() || base == 0 || nowMicros < base {
-		// poison the state, try to get other threads we are racing with to call reinit
+		// poison the state: try to get other threads we are racing with to call reinit
 		atomic.StoreUint64(&lim.state, 0)
 
-		// this is pretty wishy washy -- I think this store can be observed without
+		// this is pretty wishy-washy -- I think this store can be observed without
 		// observing the state poisoning above.  The point/hope of the lock here is
 		// to serialize with other threads also observing the wonkiness.
 		newBase := time.UnixMicro(nowMicros).Add(-(7 * 24 * time.Hour)).UnixMicro()
@@ -169,11 +174,6 @@ func (lim *Limiter) loadState() packedState {
 	return packedState(atomic.LoadUint64(&lim.state))
 }
 
-// binnedNow is time.Now() with 1 microsecond precision (on linux its usually higher)
-func (lim *Limiter) binnedTime(now time.Time) int64 {
-	return now.UnixMicro()
-}
-
 // reserve is a helper method for AllowN, ReserveN, and WaitN.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 // reserve returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
@@ -189,63 +189,60 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		return ok
 	}
 
-	binnedNow := lim.binnedTime(now)
+	nowMicros := now.UnixMicro()
+	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
 	for i := 0; i < 256; i++ {
-		base := atomic.LoadInt64(&lim.baseMicros)
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
-		if !ok {
-			lim.reinit(binnedNow)
+		if !ok || nowMicros < baseMicros {
+			// time jumped backwards a lot or our state was corrupted; do our best
+			lim.reinit(nowMicros)
+			// reinit may reset baseMicros, so reload it
+			baseMicros = atomic.LoadInt64(&lim.baseMicros)
 			continue
 		}
 
-		if binnedNow < base {
-			// time jumped backwards a lot; do our best
-			lim.reinit(binnedNow)
-			continue
-		}
+		stateTime := baseMicros + sinceBase
 
-		stateTime := base + sinceBase
-
-		// check if we are in the current epoch (or the state's epoch
-		// is in the 'future', which we treat as == current)
-		if binnedNow == stateTime {
+		if nowMicros == stateTime {
 			if tokens <= 0 {
-				// fail early to scale "obviously rate limited" traffic
+				// fail early to scale "obviously rate limited" traffic.  Under load this
+				// is the main branch taken
 				return false
 			} else {
 				// there are tokens, and we're in the same epoch as currState
 				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
 				_, writeTokens, writeOk := newPackedState.Unpack()
 				if writeOk && writeTokens >= 0 {
+					// fmt.Printf("bonus\n")
 					return true
 				}
+				// if we failed, start the loop over
+				continue
 			}
-		} else {
-			// slow path
-
-			newNowMicros, tokens := lim.advance(binnedNow, stateTime, int64(tokens))
-			if tokens < 1 {
-				// if there are no tokens available, return
-				return false
-			}
-
-			// consume 1 token
-			tokens--
-
-			newSinceBase := newNowMicros - base
-			nextState := newPackedState(newSinceBase, tokens)
-			if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
-				// CAS worked (we won the race)
-				return true
-			}
-
-			// CAS failed (someone else won the race), fallthrough.  That means
-			// with high probability lim.state's time epoch is likely to be equal
-			// to our epoch in the next iteration, avoiding doing CAS two iterations
-			// in a row
 		}
+
+		newNowMicros, tokens := lim.advance(nowMicros, stateTime, int64(tokens))
+		if tokens < 1 {
+			// if there are no tokens available, return
+			return false
+		}
+
+		// consume 1 token
+		tokens--
+
+		newSinceBase := newNowMicros - baseMicros
+		nextState := newPackedState(newSinceBase, tokens)
+		if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
+			// CAS worked (we won the race)
+			return true
+		}
+
+		// CAS failed (someone else won the race), fallthrough.  That means
+		// with high probability lim.state's time epoch is likely to be equal
+		// to our epoch in the next iteration, avoiding doing CAS two iterations
+		// in a row
 	}
 
 	// the above loop should be executed 1-2 times, meaning we should never reach here.
