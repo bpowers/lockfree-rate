@@ -190,6 +190,8 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	}
 
 	nowMicros := now.UnixMicro()
+
+	limit := lim.limit
 	maxBurst := atomic.LoadInt64(&lim.burst)
 	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
@@ -212,7 +214,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			return false
 		}
 
-		newNowMicros, tokens := lim.advance(nowMicros, stateTime, int64(tokens), maxBurst)
+		newNowMicros, tokens := advance(limit, nowMicros, stateTime, int64(tokens), maxBurst)
 		if tokens < 1 {
 			// if there are no tokens available, return
 			return false
@@ -244,7 +246,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
 // advance requires that lim.mu is held.
-func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64, maxBurst int64) (newNowMicros int64, newTokens int32) {
+func advance(lim Limit, nowMicros, lastMicros int64, oldTokens int64, maxBurst int64) (newNowMicros int64, newTokens int32) {
 	// in the event of a time jump _or_ another goroutine winning the CAS race,
 	// lastMicros may be in the future!
 	if nowMicros < lastMicros {
@@ -253,7 +255,7 @@ func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64, maxBur
 
 	// Calculate the new number of tokens, due to time that passed.
 	elapsed := time.Duration(nowMicros-lastMicros) * time.Microsecond
-	delta := lim.limit.tokensFromDuration(elapsed)
+	delta := lim.tokensFromDuration(elapsed)
 
 	// if a long time has passed we may have a lot of tokens available -- clamp
 	// it down to the max burst we've configured. The constructor ensures
@@ -268,7 +270,7 @@ func (lim *Limiter) advance(nowMicros, lastMicros int64, oldTokens int64, maxBur
 	// if we don't adjust "now" we lose fractional tokens and rate limit
 	// at a substantially different rate than users specified.
 	remaining := tokens - float64(wholeTokens)
-	adjustMicros := lim.limit.durationFromTokens(remaining) / time.Microsecond
+	adjustMicros := lim.durationFromTokens(remaining) / time.Microsecond
 	adjustedNow := nowMicros - int64(adjustMicros)
 
 	// this should always be true, but just in case ensure that the time
