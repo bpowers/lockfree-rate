@@ -8,6 +8,7 @@
 package rate
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"sync"
@@ -18,8 +19,9 @@ import (
 )
 
 func TestSize(t *testing.T) {
-	if unsafe.Sizeof(Limiter{}) != 64 {
-		t.Errorf("expected limiter to by 64 bytes in size")
+	size := unsafe.Sizeof(Limiter{})
+	if size != 10376 {
+		t.Errorf("expected limiter to by 64 bytes in size not %d", size)
 	}
 }
 
@@ -330,6 +332,14 @@ func Benchmark100000RPS(b *testing.B) {
 	benchmarkRPS(b, 100000, 1)
 }
 
+func Benchmark10000000RPS(b *testing.B) {
+	benchmarkRPS(b, 10000000, 10)
+}
+
+func Benchmark100000000RPS(b *testing.B) {
+	benchmarkRPS(b, 100000000, 100)
+}
+
 func benchmarkRPS(b *testing.B, rate Limit, burst int) {
 	b.Helper()
 
@@ -363,8 +373,24 @@ func benchmarkRPS(b *testing.B, rate Limit, burst int) {
 		tot := atomic.LoadUint64(&total)
 		allowedRPS := float64(ok) / (float64(d) / float64(time.Second))
 		overallRPS := float64(tot) / (float64(d) / float64(time.Second))
+
+		labeledHistogram("fastpath miss 1", lim.counterFastpathMiss[:])
+		labeledHistogram("fastpath miss 2", lim.counterFastpathMiss2[:])
+		labeledHistogram("fastpath allow", lim.counterFastpathAllow[:])
+		labeledHistogram("slowpath miss", lim.counterSlowpathMiss[:])
+		labeledHistogram("slowpath allow", lim.counterSlowpathAllow[:])
+		fmt.Printf("loop overflows: %d\n\n", lim.counterLoopFail)
+
 		b.Logf("%.1f RPS allowed, %.1f RPS overall. %.3f%% of %d requests in %v", allowedRPS, overallRPS, 100*float64(ok)/float64(tot), tot, d)
 	}
+}
+
+func labeledHistogram(name string, data []uint64) {
+	fmt.Printf("%s:\n", name)
+	for i := 0; i < len(data); i++ {
+		fmt.Printf("  %3d: %d\n", i, data[i])
+	}
+	fmt.Printf("\n")
 }
 
 func BenchmarkBurstRPS(b *testing.B) {

@@ -108,6 +108,14 @@ type Limiter struct {
 
 	// pad this Limiter struct to 64-bytes to avoid false sharing
 	_padding [64 - 8 - 8 - 8 - 8 - 8]byte
+	// pad to 128 bytes -- the cacheline size on macos
+	_padding2            [64]byte
+	counterFastpathAllow [256]uint64
+	counterSlowpathAllow [256]uint64
+	counterFastpathMiss  [256]uint64
+	counterFastpathMiss2 [256]uint64
+	counterSlowpathMiss  [256]uint64
+	counterLoopFail      uint64
 }
 
 // Limit returns the maximum overall event rate.
@@ -199,7 +207,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	maxBurst := atomic.LoadInt64(&lim.burst)
 	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
-	for i := 0; i < 1024; i++ {
+	for i := 0; i < 256; i++ {
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
 		if !ok || nowMicros < baseMicros {
@@ -224,6 +232,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic.  Under load this
 				// is the main branch taken and happens in the first iteration of the loop.
+				atomic.AddUint64(&lim.counterFastpathMiss[i], 1)
 				return false
 			} else {
 				// there are tokens, and we're in the same epoch as currState.  race-ily
@@ -236,15 +245,23 @@ func (lim *Limiter) reserve(now time.Time) bool {
 				// concurrent requests coming in at once.
 				newPackedState := packedState(atomic.AddUint64(&lim.state, ^uint64(0)))
 				_, writeTokens, writeOk := newPackedState.Unpack()
+				if writeOk && writeTokens >= 0 {
+					atomic.AddUint64(&lim.counterFastpathAllow[i], 1)
+					return true
+				} else {
+					atomic.AddUint64(&lim.counterFastpathMiss2[i], 1)
+					return false
+				}
 				// if write tokens is 0, it means that our write was the one that
 				// decremented tokens from 1 to 0.  We count that as a win!
-				return writeOk && writeTokens >= 0
+				// return writeOk && writeTokens >= 0
 			}
 		}
 
 		newNowMicros, tokens := advance(limit, nowMicros, lastUpdateMicros, int64(tokens), maxBurst)
 		if tokens < 1 {
 			// if there are no tokens available, return
+			atomic.AddUint64(&lim.counterSlowpathMiss[i], 1)
 			return false
 		}
 
@@ -255,6 +272,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		nextState := newPackedState(newSinceBase, tokens)
 		if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 			// CAS worked (we won the race)
+			atomic.AddUint64(&lim.counterSlowpathAllow[i], 1)
 			return true
 		}
 
@@ -268,6 +286,7 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	// We've never seen in tests this fallthrough get hit!  But to avoid some degenerate/unicorn case
 	// that causes the logic above to loop forever, we limit the times through the loop.  If we do
 	// reach here, we're in a Super Weird situation, so fail open.
+	atomic.AddUint64(&lim.counterLoopFail, 1)
 	return true
 }
 
