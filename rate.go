@@ -35,6 +35,11 @@ const catchUnderflowShift = sentinelShift - 1
 const tokensMask = (1 << catchUnderflowShift) - 1
 const maxTokens = (1 << (catchUnderflowShift - 1)) - 1
 
+// maxTries is the number of CAS loops we will go through below, and is low-ish
+// to ensure we don't live-lock in some pathological scenario.  See the loop in
+// reserve below for more color on why this is a fine limit.
+const maxTries = 256
+
 type packedState uint64
 
 func newPackedState(newSinceBase int64, tokens int32) packedState {
@@ -166,16 +171,16 @@ func (lim *Limiter) reinit(nowMicros int64) {
 	}
 }
 
-// Allow is shorthand for AllowN(time.Now(), 1).
-func (lim *Limiter) Allow() bool {
-	return lim.reserve(time.Now())
-}
-
 // InfDuration is the duration returned by Delay when a Reservation is not OK.
 const InfDuration = time.Duration(1<<63 - 1)
 
 func (lim *Limiter) loadState() packedState {
 	return packedState(atomic.LoadUint64(&lim.state))
+}
+
+// Allow returns true if there was an available token in the limiter.
+func (lim *Limiter) Allow() bool {
+	return lim.reserve(time.Now())
 }
 
 // reserve is a helper method for AllowN, ReserveN, and WaitN.
@@ -199,9 +204,11 @@ func (lim *Limiter) reserve(now time.Time) bool {
 	maxBurst := atomic.LoadInt64(&lim.burst)
 	baseMicros := atomic.LoadInt64(&lim.baseMicros)
 
-	for i := 0; i < 1024; i++ {
+	for i := 0; i < maxTries; i++ {
+		// atomically load the state once, then unpack it
 		currState := lim.loadState()
 		sinceBase, tokens, ok := currState.Unpack()
+		// basic sanity checking to ensure state is properly initialized
 		if !ok || nowMicros < baseMicros {
 			// time jumped backwards a lot or our state was corrupted; do our best
 			lim.reinit(nowMicros)
@@ -213,13 +220,12 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		lastUpdateMicros := baseMicros + sinceBase
 
 		// CPUs are fast, so "binning" time to microseconds (1,000 nanoseconds,
-		// 1/1,000 of a millisecond) leaves us with a pretty coarse grained measure
-		// of advancing time (more like a staircase than a sloped hill).  Consequently,
-		// if there is a lot of traffic for this rate limiter we expect last update to
-		// be equal to now micros most of the time (especially if we are on the second
-		// iteration of this loop, having just lost the CAS race to another goroutine).
-		// Handling this case separately, first, gives us a fast path that reduces
-		// contention and helps us scale.
+		// 1/1,000 of a millisecond) leaves us with a pretty coarse-grained measure
+		// of advancing time that looks more like a staircase than a sloped hill.
+		// As traffic governed by this rate limiter goes up, this condition will be
+		// true a higher percentage of the time, reducing contention and trips through
+		// the outer loop.  Additionally, after the first iteration if this loop we
+		// also expect the likelihood of hitting this condition to increase.
 		if nowMicros == lastUpdateMicros {
 			if tokens <= 0 {
 				// fail early to scale "obviously rate limited" traffic.  Under load this
@@ -259,15 +265,17 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		}
 
 		// CAS failed (someone else won the race), fallthrough.  That means
-		// with high probability lim.state's time epoch is likely to be equal
-		// to our epoch in the next iteration, avoiding doing CAS two iterations
-		// in a row
+		// with high probability lim.state's time epoch will be equal
+		// to our epoch in the next iteration, and we will fall into the first if
+		// statement next iteration.
 	}
 
-	// The above loop should be executed 1-2 times before one of the return statements is triggered.
-	// We've never seen in tests this fallthrough get hit!  But to avoid some degenerate/unicorn case
-	// that causes the logic above to loop forever, we limit the times through the loop.  If we do
-	// reach here, we're in a Super Weird situation, so fail open.
+	// The above loop should be executed 1-2 times under normal operation before one of the return
+	// statements is triggered. To avoid some degenerate case that causes a goroutine to fail to
+	// make progress, we limit the times through the loop.  If we do reach here, it is because we
+	// failed over 200 times to update the state AND each time through the loop there were available
+	// tokens (otherwise we would have exited early with `false`). Because we will only hit this
+	// end-of-function return when there are still tokens in the rate limiter, return true.
 	return true
 }
 
