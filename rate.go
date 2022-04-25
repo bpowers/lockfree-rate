@@ -40,22 +40,42 @@ const maxTokens = (1 << (catchUnderflowShift - 1)) - 1
 // reserve below for more color on why this is a fine limit.
 const maxTries = 256
 
+// packedState conceptually fits both "last updated" and "tokens remaining" into
+// a single 64-bit value that can be read and set atomically.  The packed state
+// looks like:
+//
+//	              1 bit: always-1 underflow catch -
+//	                   1 bit: always-1 sentinel -  |
+//	44-bits: microsecond-resolution duration     | | 18-bits: signed token count
+//	____________________________________________ _ _ __________________
+//
+// The "clever" part is that we always initialize 2 bits to 1 in between the packed
+// values. Immediately adjacent to the token count is a bit set to 1 ("underflow
+// catch" in the diagram above).  If token count was 0 (all 18-bits are zero) and we
+// decrement it (like happens in the first conditional in the loop below), the
+// underflow catch bit will be distributed right and all 18-bits will now be 1 (-1
+// in twos-compliment).  This ensures that race-y decrement is safe and doesn't impact
+// the stored duration.  We keep an extra "sentinel" value between the underflow catch
+// bit and the duration to ensure that we can tell if state has been initialized, and
+// as a backstop in case the non-conditional decrements go wrong in some unknown way.
 type packedState uint64
 
-func newPackedState(newSinceBase int64, tokens int32) packedState {
-	if newSinceBase < 0 {
-		newSinceBase = 0
+// newPackedState packs a microsecond-resolution time duration along with a token
+// count into a single 32-bit value.
+func newPackedState(timeDiffMicros int64, tokens int32) packedState {
+	if timeDiffMicros < 0 {
+		timeDiffMicros = 0
 	}
 	if tokens < 0 {
 		tokens = 0
 	}
-	return packedState((uint64(newSinceBase) << timeShift) | (0x1 << sentinelShift) | (0x1 << catchUnderflowShift) | (uint64(tokens) & tokensMask))
+	return packedState((uint64(timeDiffMicros) << timeShift) | (0x1 << sentinelShift) | (0x1 << catchUnderflowShift) | (uint64(tokens) & tokensMask))
 }
 
 func (ps packedState) tokens() int32 {
 	tokens := int32(ps & tokensMask)
-	// do this shift dance after we've masked to left-fill 1s in the case of a
-	// transition from 0 -> -1.  Check out TestUnderflow for details.
+	// this ensures that negative values are properly represented in our widening
+	// from 18 to 32 bits. Check out TestUnderflow for details.
 	return (tokens << (32 - catchUnderflowShift)) >> (32 - catchUnderflowShift)
 }
 
@@ -82,18 +102,8 @@ func (ps packedState) Unpack() (sinceBaseMicros int64, tokens int32, ok bool) {
 // The zero value is a valid Limiter, but it will reject all events.
 // Use NewLimiter to create non-zero Limiters.
 //
-// Limiter has three main methods, Allow, Reserve, and Wait.
-// Most callers should use Wait.
-//
-// Each of the three methods consumes a single token.
-// They differ in their behavior when no token is available.
+// Limiter has one main methods, Allow.  Allow consumes a single token.
 // If no token is available, Allow returns false.
-// If no token is available, Reserve returns a reservation for a future token
-// and the amount of time the caller must wait before using it.
-// If no token is available, Wait blocks until one can be obtained
-// or its associated context.Context is canceled.
-//
-// The methods AllowN, ReserveN, and WaitN consume n tokens.
 type Limiter struct {
 	// static config
 	limit Limit
@@ -121,8 +131,8 @@ func (lim *Limiter) Limit() Limit {
 }
 
 // Burst returns the maximum burst size. Burst is the maximum number of tokens
-// that can be consumed in a single call to Allow, Reserve, or Wait, so higher
-// Burst values allow more events to happen at once.
+// that can be consumed in a single call to Allow, so higher Burst values allow
+// more events to happen at once.
 // A zero Burst allows no events, unless limit == Inf.
 func (lim *Limiter) Burst() int {
 	burst := atomic.LoadInt64(&lim.burst)
@@ -130,7 +140,8 @@ func (lim *Limiter) Burst() int {
 }
 
 // NewLimiter returns a new Limiter that allows events up to rate r and permits
-// bursts of at most b tokens.
+// bursts of at most b tokens.  NOTE: the maximum burst we can represent is a
+// little over 100k tokens; bursts greater than that will be truncated.
 func NewLimiter(r Limit, b int) *Limiter {
 	if b > maxTokens {
 		log.Printf("rate.NewLimiter: burst %d bigger than max %d, using %d", b, maxTokens, maxTokens)
@@ -183,9 +194,8 @@ func (lim *Limiter) Allow() bool {
 	return lim.reserve(time.Now())
 }
 
-// reserve is a helper method for AllowN, ReserveN, and WaitN.
-// maxFutureReserve specifies the maximum reservation wait duration allowed.
-// reserve returns Reservation, not *Reservation, to avoid allocation in AllowN and WaitN.
+// reserve is a helper method for Allow -- in particular it is used in testing where
+// time is mocked.
 func (lim *Limiter) reserve(now time.Time) bool {
 	if lim.limit == Inf {
 		return true
@@ -257,8 +267,8 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		// consume 1 token
 		tokens--
 
-		newSinceBase := newNowMicros - baseMicros
-		nextState := newPackedState(newSinceBase, tokens)
+		nextTimeDiffMicros := newNowMicros - baseMicros
+		nextState := newPackedState(nextTimeDiffMicros, tokens)
 		if ok := atomic.CompareAndSwapUint64(&lim.state, uint64(currState), uint64(nextState)); ok {
 			// CAS worked (we won the race)
 			return true
@@ -270,18 +280,23 @@ func (lim *Limiter) reserve(now time.Time) bool {
 		// statement next iteration.
 	}
 
-	// The above loop should be executed 1-2 times under normal operation before one of the return
-	// statements is triggered. To avoid some degenerate case that causes a goroutine to fail to
-	// make progress, we limit the times through the loop.  If we do reach here, it is because we
-	// failed over 200 times to update the state AND each time through the loop there were available
-	// tokens (otherwise we would have exited early with `false`). Because we will only hit this
-	// end-of-function return when there are still tokens in the rate limiter, return true.
+	// The above loop will normally execute 1-2 times before one of the return statements
+	// is triggered. To ensure we don't live-lock in some pathological case (for example,
+	// some NUMA system where different cores have significant clock drift) we limit the
+	// number of times the above loop executes.  If we _do_ hit that limit, it is because
+	// we failed over 200 times to update the state.  The only way that could happen is if
+	// (1) we tried and lost that CAS race each iteration (meaning another goroutine won
+	// and made progress) and (2) there are still tokens available (otherwise we would have
+	// exited early -- we don't attempt the CAS if it wouldn't result in us acquiring a
+	// token).  This feels like a fine compromise: we will return "true" here only in the
+	// case where there is _both_ a very high request rate on this limiter _and_ a very
+	// high rate limit set.  In testing, this has meant a limiter configured with limits
+	// greater than 5M RPS.
 	return true
 }
 
 // advance calculates and returns an updated state for lim resulting from the passage of time.
 // lim is not changed.
-// advance requires that lim.mu is held.
 func advance(lim Limit, nowMicros, lastMicros int64, oldTokens int64, maxBurst int64) (newNowMicros int64, newTokens int32) {
 	// in the event of a time jump _or_ another goroutine winning the CAS race,
 	// lastMicros may be in the future!
@@ -295,7 +310,8 @@ func advance(lim Limit, nowMicros, lastMicros int64, oldTokens int64, maxBurst i
 		oldTokens = 0
 	}
 
-	// Calculate the new number of tokens, due to time that passed.
+	// Calculate the new number of tokens, due to time that passed.  We want to do
+	// this math in nanosecond precision rather than microseconds to ensure accuracy.
 	elapsed := time.Duration(nowMicros-lastMicros) * time.Microsecond
 	delta := lim.tokensFromDuration(elapsed)
 
