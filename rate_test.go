@@ -14,7 +14,44 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestSize(t *testing.T) {
+	if unsafe.Sizeof(Limiter{}) != 64 {
+		t.Errorf("expected limiter to by 64 bytes in size")
+	}
+}
+
+func TestShifting(t *testing.T) {
+	// half year + 1 microsecond in microseconds
+	const yearMicros = uint64((180*24*time.Hour + 1000) / time.Microsecond)
+
+	if (yearMicros<<timeShift)>>timeShift != yearMicros {
+		t.Errorf("timeShift too big to losslessly deal with our duration")
+	}
+}
+
+func TestUnderflow(t *testing.T) {
+	s := uint64(newPackedState(0, 0))
+
+	// -1 in uint64-speak
+	atomic.AddUint64(&s, ^uint64(0))
+
+	lastUpdate, toks, ok := packedState(s).Unpack()
+
+	if toks != -1 {
+		t.Fatalf("expected toks to be -1 not %d", toks)
+	}
+
+	if !ok {
+		t.Fatalf("expected undeflow to be ok")
+	}
+
+	if lastUpdate != 0 {
+		t.Fatalf("expected lastUpdate to be un-affected")
+	}
+}
 
 func TestLimit(t *testing.T) {
 	if Limit(10) == Inf {
@@ -257,15 +294,20 @@ func dSince(t time.Time) int {
 }
 
 func BenchmarkAllowN(b *testing.B) {
-	lim := NewLimiter(Every(1*time.Second), 1)
+	var numOK = uint64(0)
+
+	lim := NewLimiter(2000, 50)
 	now := time.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			lim.reserve(now)
+			if lim.reserve(now) {
+				atomic.AddUint64(&numOK, 1)
+			}
 		}
 	})
+	b.Logf("allowed %d requests through", atomic.LoadUint64(&numOK))
 }
 
 func Benchmark10RPS(b *testing.B) {
@@ -331,7 +373,7 @@ func BenchmarkBurstRPS(b *testing.B) {
 	var total = uint64(0)
 	var numOK = uint64(0)
 
-	lim := NewLimiter(50000, 50000)
+	lim := NewLimiter(100000, 100000)
 
 	b.ReportAllocs()
 	b.ResetTimer()
